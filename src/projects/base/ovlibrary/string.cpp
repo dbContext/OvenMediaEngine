@@ -628,18 +628,16 @@ namespace ov
 		return lower;
 	}
 
-	std::vector<String> String::Split(const char *separator) const
+	std::vector<String> String::Split(const char *separator, size_t max_count) const
 	{
-		return String::Split(CStr(), separator);
+		return std::move(String::Split(CStr(), separator, max_count));
 	}
 
-	std::vector<String> String::Split(const char *string, const char *separator) const
+	std::vector<String> String::Split(const char *string, const char *separator, size_t max_count) const
 	{
 		std::vector<String> list;
 		const char *last;
-		size_t token_length;
 		size_t seperator_length;
-		char token[1024];
 
 		if(separator == nullptr)
 		{
@@ -648,50 +646,42 @@ namespace ov
 				list.emplace_back(string);
 			}
 
-			return list;
+			return std::move(list);
 		}
 
-		seperator_length = (int)strlen(separator);
+		seperator_length = (int)::strlen(separator);
 
-		if(((string == nullptr) || (strlen(string) == 0L)) || (seperator_length == 0L))
+		if(((string == nullptr) || (::strlen(string) == 0L)) || (seperator_length == 0L))
 		{
 			if(string != nullptr)
 			{
 				list.emplace_back(string);
 			}
 
-			return list;
+			return std::move(list);
 		}
 
-		while(true)
+		size_t token_count = 0;
+		max_count = std::max(max_count, 1UL);
+
+		while(token_count < max_count)
 		{
 			last = ::strstr(string, separator);
 
-			if(last == nullptr)
-			{
-				token_length = ::strlen(string);
+			auto length = ((last == nullptr) || (token_count == (max_count - 1))) ? (::strlen(string) * sizeof(char)) : ((last - string) * sizeof(char));
 
-				::memcpy(&(token[0]), string, token_length * sizeof(char));
-			}
-			else
-			{
-				token_length = (last - string);
-
-				::memcpy(&(token[0]), string, token_length * sizeof(char));
-			}
-
-			token[token_length] = '\0';
-			list.emplace_back(token);
-
+			list.emplace_back(string, length);
+			
 			if(last == nullptr)
 			{
 				break;
 			}
 
 			string = last + seperator_length;
+			token_count++;
 		}
 
-		return list;
+		return std::move(list);
 	}
 
 	String String::Join(const std::vector<String> &list, const char *seperator)

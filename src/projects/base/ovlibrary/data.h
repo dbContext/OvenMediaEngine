@@ -66,6 +66,24 @@ namespace ov
 			return reinterpret_cast<const T *>(GetData());
 		}
 
+		inline const uint8_t At(off_t index) const
+		{
+			return AtAs<uint8_t>(index);
+		}
+
+		template<typename T = uint8_t>
+		inline const T AtAs(off_t index) const
+		{
+			if((index < 0) || ((index * sizeof(T)) >= GetLength()))
+			{
+				return T();
+			}
+
+			auto data = GetDataAs<const T>();
+
+			return data[index];
+		}
+
 		/// Get the writable pointer
 		///
 		/// @return writable pointer
@@ -91,6 +109,12 @@ namespace ov
 		inline size_t GetLength() const noexcept
 		{
 			return _length;
+		}
+
+		// For debugging
+		inline size_t GetAllocatedDataSize() const
+		{
+			return (_allocated_data != nullptr) ? _allocated_data->size() : 0ULL;
 		}
 
 		inline bool SetLength(size_t length)
@@ -137,6 +161,8 @@ namespace ov
 
 		bool Append(const void *data, size_t length);
 		bool Append(const Data *data);
+		bool Append(const std::shared_ptr<Data> &data);
+		bool Append(const std::shared_ptr<const Data> &data);
 
 		bool Erase(off_t offset, size_t length);
 
@@ -156,6 +182,8 @@ namespace ov
 		std::shared_ptr<Data> Subdata(off_t offset);
 		std::shared_ptr<const Data> Subdata(off_t offset) const;
 
+		Data &operator =(const Data &data);
+
 		bool operator ==(const Data &data) const;
 		bool operator ==(const Data *data) const;
 
@@ -167,10 +195,13 @@ namespace ov
 			return IsEqual(data->GetData(), data->GetLength());
 		}
 
+		bool IsEmpty() const;
+
 		String Dump(size_t max_bytes = 1024) const noexcept;
 		String Dump(const char *title, const char *line_prefix) const noexcept;
 		String Dump(const char *title, off_t offset = 0, size_t max_bytes = 1024, const char *line_prefix = nullptr) const noexcept;
 		String ToString() const;
+		String ToHexString() const;
 
 	protected:
 		std::shared_ptr<const Data> SubdataInternal(off_t offset, size_t length) const;
@@ -195,4 +226,42 @@ namespace ov
 		//     <length of _reference_data>
 		size_t _length = 0;
 	};
+
+	template<typename T>
+	bool Serialize(ov::Data &data, const std::vector<T> &vector)
+	{
+		// TODO: implement network byte order
+		size_t size = vector.size();
+		return data.Append(&size, sizeof(size)) && ((size == 0) || (data.Append(vector.data(), size * sizeof(T))));
+	}
+
+
+	template<typename T>
+	bool Deserialize(const uint8_t *&bytes, size_t &length, std::vector<T> &vector, size_t &bytes_consumed)
+	{
+		// TODO: implement network byte order
+		const uint8_t *position = bytes;
+		size_t bytes_remaining = length;
+
+		if (bytes_remaining < sizeof(size_t))
+		{
+			return false;
+		}
+		const size_t size = *reinterpret_cast<const size_t*>(position);
+		position += sizeof(size_t);
+		bytes_remaining -= sizeof(size_t);
+		
+		if (bytes_remaining < size * sizeof(T))
+		{
+			return false;
+		}
+		vector.insert(vector.end(), reinterpret_cast<const T*>(position), reinterpret_cast<const T*>(position) + size);
+		position += size * sizeof(T);
+		bytes_remaining -= size * sizeof(T);
+
+		bytes_consumed += length - bytes_remaining;
+		length = bytes_remaining;
+		bytes = position;
+		return true;
+	}
 }

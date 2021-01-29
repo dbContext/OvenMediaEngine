@@ -2,51 +2,82 @@ LOCAL_PATH := $(call get_local_path)
 include $(DEFAULT_VARIABLES)
 
 LOCAL_STATIC_LIBRARIES := \
-	webrtc \
+	webrtc_publisher \
+	segment_publishers \
+	ovt_publisher \
+	file_publisher \
+	rtmppush_publisher \
+	thumbnail_publisher \
+	ovt_provider \
+	rtmp_provider \
+	mpegts_provider \
+	rtspc_provider \
 	transcoder \
 	rtc_signalling \
 	ice \
-	jsoncpp \
+	api_server \
+	bitstream \
+	containers \
 	http_server \
-	relay \
 	dtls_srtp \
 	rtp_rtcp \
 	sdp \
-	publisher \
+	segment_writer \
 	web_console \
 	mediarouter \
+	ovt_packetizer \
+	orchestrator \
+	publisher \
 	application \
+	signature \
 	physical_port \
 	socket \
 	ovcrypto \
 	config \
 	ovlibrary \
-	rtmpprovider \
-	hls \
-	dash \
-	segment_stream \
 	monitoring \
 	jsoncpp \
-	sqlite
+	sqlite \
+	file \
+	rtmp \
+
+# rtsp_provider 
 
 LOCAL_PREBUILT_LIBRARIES := \
 	libpugixml.a
 
-LOCAL_LDFLAGS := \
-	-lpthread \
-	-ldl \
-	`pkg-config --libs srt` \
-	`pkg-config --libs libavformat` \
-	`pkg-config --libs libavfilter` \
-	`pkg-config --libs libavcodec` \
-	`pkg-config --libs libswresample` \
-	`pkg-config --libs libswscale` \
-	`pkg-config --libs libavutil` \
-	`pkg-config --libs openssl` \
-	`pkg-config --libs vpx` \
-	`pkg-config --libs opus` \
-	`pkg-config --libs libsrtp2`
+LOCAL_LDFLAGS := -lpthread
+
+ifeq ($(shell echo $${OSTYPE}),linux-musl) 
+# For alpine linux
+LOCAL_LDFLAGS += -lexecinfo
+endif
+
+$(call add_pkg_config,srt)
+$(call add_pkg_config,libavformat)
+$(call add_pkg_config,libavfilter)
+$(call add_pkg_config,libavcodec)
+$(call add_pkg_config,libswresample)
+$(call add_pkg_config,libswscale)
+$(call add_pkg_config,libavutil)
+$(call add_pkg_config,openssl)
+$(call add_pkg_config,vpx)
+$(call add_pkg_config,opus)
+$(call add_pkg_config,libsrtp2)
+$(call add_pkg_config,libpcre2-8)
+
+# Temporarily stop using JEMALLOC. We will test it more and use it again.
+#ifeq ($(MAKECMDGOALS),release)
+	# Enable jemalloc 
+	# $(call add_pkg_config,jemalloc)
+#endif
 
 LOCAL_TARGET := OvenMediaEngine
+
+# Update git information
+PRIVATE_MAIN_PATH := $(LOCAL_PATH)
+$(shell "$(PRIVATE_MAIN_PATH)/update_git_info.sh" >/dev/null 2>&1)
+
+BUILD_FILES_TO_CLEAN += "$(PRIVATE_MAIN_PATH)/git_info.h"
 
 include $(BUILD_EXECUTABLE)

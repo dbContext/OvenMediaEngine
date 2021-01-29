@@ -51,28 +51,50 @@ typedef enum OVLogLevel
 		OVLogLevelCritical
 } OVLogLevel;
 
-#if DEBUG
-#   define logd(tag, format, ...)                     ov_log_internal(OVLogLevelDebug,          tag, __FILE__, __LINE__, __PRETTY_FUNCTION__, format, ## __VA_ARGS__) // NOLINT
-#else
-#   define logd                                       ov_log_dummy
-
-constexpr void ov_log_dummy(...)
+typedef enum StatLogType
 {
-}
+	STAT_LOG_WEBRTC_EDGE_SESSION,
+	STAT_LOG_WEBRTC_EDGE_REQUEST,
+	STAT_LOG_WEBRTC_EDGE_VIEWERS,
+	STAT_LOG_HLS_EDGE_SESSION,
+	STAT_LOG_HLS_EDGE_REQUEST,
+	STAT_LOG_HLS_EDGE_VIEWERS
+} StatLogType;
 
+#if DEBUG
+#	define logd(tag, format, ...)                     ov_log_internal(OVLogLevelDebug,          tag, __FILE__, __LINE__, __PRETTY_FUNCTION__, format, ## __VA_ARGS__)
+#	define logp(tag, format, ...)                       \
+		while (ov_log_get_enabled(tag, OVLogLevelDebug)) \
+		{                                                \
+			logd(tag, format, ##__VA_ARGS__);            \
+			break;                                       \
+		}
+#else
+#	define logd(...)                                  do {} while(false)
+#	define logp                                       logd
 #endif // DEBUG
-#define logi(tag, format, ...)                        ov_log_internal(OVLogLevelInformation,    tag, __FILE__, __LINE__, __PRETTY_FUNCTION__, format, ## __VA_ARGS__) // NOLINT
-#define logw(tag, format, ...)                        ov_log_internal(OVLogLevelWarning,        tag, __FILE__, __LINE__, __PRETTY_FUNCTION__, format, ## __VA_ARGS__) // NOLINT
-#define loge(tag, format, ...)                        ov_log_internal(OVLogLevelError,          tag, __FILE__, __LINE__, __PRETTY_FUNCTION__, format, ## __VA_ARGS__) // NOLINT
-#define logc(tag, format, ...)                        ov_log_internal(OVLogLevelCritical,       tag, __FILE__, __LINE__, __PRETTY_FUNCTION__, format, ## __VA_ARGS__) // NOLINT
+//--------------------------------------------------------------------
+// Logging APIs
+//--------------------------------------------------------------------
+#define logi(tag, format, ...)                        ov_log_internal(OVLogLevelInformation,    tag, __FILE__, __LINE__, __PRETTY_FUNCTION__, format, ## __VA_ARGS__)
+#define logw(tag, format, ...)                        ov_log_internal(OVLogLevelWarning,        tag, __FILE__, __LINE__, __PRETTY_FUNCTION__, format, ## __VA_ARGS__)
+#define loge(tag, format, ...)                        ov_log_internal(OVLogLevelError,          tag, __FILE__, __LINE__, __PRETTY_FUNCTION__, format, ## __VA_ARGS__)
+#define logc(tag, format, ...)                        ov_log_internal(OVLogLevelCritical,       tag, __FILE__, __LINE__, __PRETTY_FUNCTION__, format, ## __VA_ARGS__)
 
-#define logtd(format, ...)                            logd(OV_LOG_TAG, format, ## __VA_ARGS__) // NOLINT
-#define logtp(format, ...)                            logd(OV_LOG_TAG ".Packet", format, ## __VA_ARGS__) // NOLINT
+//--------------------------------------------------------------------
+// Logging APIs with tag
+//--------------------------------------------------------------------
+#define logtd(format, ...)                            logd(OV_LOG_TAG, format, ## __VA_ARGS__)
+// for packet
+#define logtp(format, ...)                            logp(OV_LOG_TAG ".Packet", format, ## __VA_ARGS__)
+// for statistics
+#define logts(format, ...)                            logi(OV_LOG_TAG ".Stat", format, ## __VA_ARGS__)
+#define logti(format, ...)                            logi(OV_LOG_TAG, format, ## __VA_ARGS__)
+#define logtw(format, ...)                            logw(OV_LOG_TAG, format, ## __VA_ARGS__)
+#define logte(format, ...)                            loge(OV_LOG_TAG, format, ## __VA_ARGS__)
+#define logtc(format, ...)                            logc(OV_LOG_TAG, format, ## __VA_ARGS__)
 
-#define logti(format, ...)                            logi(OV_LOG_TAG, format, ## __VA_ARGS__) // NOLINT
-#define logtw(format, ...)                            logw(OV_LOG_TAG, format, ## __VA_ARGS__) // NOLINT
-#define logte(format, ...)                            loge(OV_LOG_TAG, format, ## __VA_ARGS__) // NOLINT
-#define logtc(format, ...)                            logc(OV_LOG_TAG, format, ## __VA_ARGS__) // NOLINT
+#define stat_log(type, format, ...)                         ov_stat_log_internal(type, OVLogLevelInformation,    "STAT", __FILE__, __LINE__, __PRETTY_FUNCTION__, format, ## __VA_ARGS__)
 
 /// 모든 log에 1차적으로 적용되는 filter 규칙
 ///
@@ -85,6 +107,8 @@ void ov_log_reset_enable();
 /// @param level level 이상의 로그에 대해서만 is_enable 적용. level을 벗어나는 로그는 !is_enable로 간주함
 /// @param is_enabled 활성화 여부
 ///
+/// @returns 성공적으로 적용되었는지 여부
+///
 /// @remarks 정규식 사용의 예: "App\..+" == "App.Hello", "App.World", "App.foo", "App.bar", ....
 ///          (정규식에 대해서는 http://www.cplusplus.com/reference/regex/ECMAScript 참고)
 ///          가장 먼저 입력된 tag_regex의 우선순위가 높음.
@@ -93,11 +117,15 @@ void ov_log_reset_enable();
 ///          예2) level이 warning 이면서 is_enabled가 false면, warning~critical 로그 출력 안함.
 ///          예3) level이 warning 이면서 is_enabled가 true면, debug~information 로그 출력 안함, warning~critical 로그 출력함.
 ///          예4) level이 info 이면서 is_enabled가 true, debug 로그 출력 안함, information~critical 로그 출력함.
-void ov_log_set_enable(const char *tag_regex, OVLogLevel level, bool is_enabled);
+bool ov_log_set_enable(const char *tag_regex, OVLogLevel level, bool is_enabled);
+bool ov_log_get_enabled(const char *tag, OVLogLevel level);
 
 void ov_log_internal(OVLogLevel level, const char *tag, const char *file, int line, const char *method, const char *format, ...);
-
 void ov_log_set_path(const char *log_path);
+
+void ov_stat_log_internal(StatLogType type, OVLogLevel level, const char *tag, const char *file, int line, const char *method, const char *format, ...);
+void ov_stat_log_set_path(StatLogType type, const char *log_path);
+
 
 #ifdef __cplusplus
 }

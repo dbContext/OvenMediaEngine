@@ -7,53 +7,82 @@
 //
 //==============================================================================
 
-#include <iostream>
-#include <unistd.h>
-
 #include "transcode_application.h"
 
-#define OV_LOG_TAG "TranscodeApplication"
+#include <unistd.h>
 
-std::shared_ptr<TranscodeApplication> TranscodeApplication::Create(const info::Application *application_info)
+#include <iostream>
+
+#include "transcode_private.h"
+
+#define MIN_APPLICATION_WORKER_COUNT 1
+#define MAX_APPLICATION_WORKER_COUNT 72
+#define MAX_QUEUE_SIZE 100
+
+std::shared_ptr<TranscodeApplication> TranscodeApplication::Create(const info::Application &application_info)
 {
 	auto instance = std::make_shared<TranscodeApplication>(application_info);
-
+	instance->Start();
 	return instance;
 }
 
-TranscodeApplication::TranscodeApplication(const info::Application *application_info)
+TranscodeApplication::TranscodeApplication(const info::Application &application_info)
 	: _application_info(application_info)
 {
-	logtd("Transcode application [%s] is created", _application_info->GetName().CStr());
+	logti("Created transcoder application. app(%s)", application_info.GetName().CStr());
 }
 
 TranscodeApplication::~TranscodeApplication()
 {
-	logtd("Destroyed transcode application.");
+	logti("Transcoder application has been destroyed. app(%s)", _application_info.GetName().CStr());
 }
 
-bool TranscodeApplication::OnCreateStream(std::shared_ptr<StreamInfo> stream_info)
+bool TranscodeApplication::Start()
 {
-	logtd("OnCreateStream (%s)", stream_info->GetName().CStr());
+	return true;
+}
 
+bool TranscodeApplication::Stop()
+{
+	for (const auto &it : _streams)
+	{
+		auto stream = it.second;
+		stream->Stop();
+	}
+	_streams.clear();
+
+	logtd("Transcoder application has been stopped. app(%s)", _application_info.GetName().CStr());
+
+	return true;
+}
+
+bool TranscodeApplication::OnStreamCreated(const std::shared_ptr<info::Stream> &stream_info)
+{
 	std::unique_lock<std::mutex> lock(_mutex);
 
 	auto stream = std::make_shared<TranscodeStream>(_application_info, stream_info, this);
+	if (stream == nullptr)
+	{
+		return false;
+	}
+
+	if (stream->Start() == false)
+	{
+		return false;
+	}
 
 	_streams.insert(std::make_pair(stream_info->GetId(), stream));
 
 	return true;
 }
 
-bool TranscodeApplication::OnDeleteStream(std::shared_ptr<StreamInfo> stream_info)
+bool TranscodeApplication::OnStreamDeleted(const std::shared_ptr<info::Stream> &stream_info)
 {
-	logtd("OnDeleteStream (%s)", stream_info->GetName().CStr());
-
 	std::unique_lock<std::mutex> lock(_mutex);
 
 	auto stream_bucket = _streams.find(stream_info->GetId());
 
-	if(stream_bucket == _streams.end())
+	if (stream_bucket == _streams.end())
 	{
 		return false;
 	}
@@ -67,28 +96,29 @@ bool TranscodeApplication::OnDeleteStream(std::shared_ptr<StreamInfo> stream_inf
 	return true;
 }
 
-bool TranscodeApplication::OnSendVideoFrame(std::shared_ptr<StreamInfo> stream_info, std::shared_ptr<MediaTrack> track, std::unique_ptr<EncodedFrame> encoded_frame, std::unique_ptr<CodecSpecificInfo> codec_info, std::unique_ptr<FragmentationHeader> fragmentation)
+bool TranscodeApplication::OnStreamPrepared(const std::shared_ptr<info::Stream> &stream)
 {
+	std::unique_lock<std::mutex> lock(_mutex);
+
+	// Do nothing
+	
+	// logtw("Called OnStreamParsed. *Please delete this log after checking.*");
+	
 	return true;
 }
 
-bool TranscodeApplication::OnSendAudioFrame(std::shared_ptr<StreamInfo> stream, std::shared_ptr<MediaTrack> track, std::unique_ptr<EncodedFrame> encoded_frame, std::unique_ptr<CodecSpecificInfo> codec_info, std::unique_ptr<FragmentationHeader> fragmentation)
-{
-	return true;
-}
-
-bool TranscodeApplication::OnSendFrame(std::shared_ptr<StreamInfo> stream_info, std::unique_ptr<MediaPacket> packet)
+bool TranscodeApplication::OnSendFrame(const std::shared_ptr<info::Stream> &stream_info, const std::shared_ptr<MediaPacket> &packet)
 {
 	std::unique_lock<std::mutex> lock(_mutex);
 
 	auto stream_bucket = _streams.find(stream_info->GetId());
 
-	if(stream_bucket == _streams.end())
+	if (stream_bucket == _streams.end())
 	{
 		return false;
 	}
 
 	auto stream = stream_bucket->second;
 
-	return stream->Push(std::move(packet));
+	return stream->Push(packet);
 }

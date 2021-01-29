@@ -15,6 +15,7 @@
 #include "../ovlibrary/assert.h"
 #include "../ovlibrary/byte_ordering.h"
 #include "../ovlibrary/ovlibrary.h"
+#include "../ovlibrary/converter.h"
 
 namespace ov
 {
@@ -57,9 +58,10 @@ namespace ov
 
 		if(result == false)
 		{
-			logte("An error occured: %s", host_port.CStr());
-			// OV_ASSERT2(result);
+			logte("An error occurred: %s", host_port.CStr());
 		}
+
+		UpdateIPAddress();
 	}
 
 	SocketAddress::SocketAddress(const ov::String &hostname, uint16_t port)
@@ -78,11 +80,7 @@ namespace ov
 		bool result = SetHostname(hostname);
 		result = result && SetPort(port);
 
-		if(result == false)
-		{
-			logte("An error occured: %s:%d", hostname, port);
-			// OV_ASSERT2(result);
-		}
+		UpdateIPAddress();
 	}
 
 	SocketAddress::SocketAddress(const sockaddr_in &addr_in)
@@ -273,7 +271,7 @@ namespace ov
 
 				if(::getaddrinfo(hostname, nullptr, nullptr, &result) != 0)
 				{
-					logte("An error occurred while resolve DNS for host [%s]", hostname);
+					logtw("An error occurred while resolve DNS for host [%s]", hostname);
 					return false;
 				}
 
@@ -382,7 +380,7 @@ namespace ov
 		{
 			case AF_INET:
 				return NetworkToHost16(_address_ipv4->sin_port);
-
+				
 			case AF_INET6:
 				return NetworkToHost16(_address_ipv6->sin6_port);
 
@@ -462,6 +460,6 @@ namespace ov
 
 	ov::String SocketAddress::ToString() const noexcept
 	{
-		return ov::String::FormatString("[%s] %s:%d", (_address_storage.ss_family == AF_INET) ? "v4" : (_address_storage.ss_family == AF_INET6 ? "v6" : "?"), GetIpAddress().CStr(), Port());
+		return ov::String::FormatString("%s%s:%d", (_address_storage.ss_family == AF_INET) ? "" : (_address_storage.ss_family == AF_INET6 ? "[v6]" : "[?]"), GetIpAddress().CStr(), Port());
 	}
 }

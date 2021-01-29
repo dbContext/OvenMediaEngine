@@ -7,8 +7,11 @@
 //
 //==============================================================================
 #include "server_socket.h"
-#include "socket_private.h"
+
+#include <netinet/tcp.h>
+
 #include "client_socket.h"
+#include "socket_private.h"
 
 namespace ov
 {
@@ -17,23 +20,23 @@ namespace ov
 	}
 
 	bool ServerSocket::Prepare(SocketType type,
-                                uint16_t port,
-                                int send_buffer_size,
-                                int recv_buffer_size,
-                                int backlog)
+							   uint16_t port,
+							   int send_buffer_size,
+							   int recv_buffer_size,
+							   int backlog)
 	{
 		return Prepare(type, SocketAddress(port), send_buffer_size, recv_buffer_size, backlog);
 	}
 
 	bool ServerSocket::Prepare(SocketType type,
-                               const SocketAddress &address,
-                               int send_buffer_size,
-                               int recv_buffer_size,
-                               int backlog)
+							   const SocketAddress &address,
+							   int send_buffer_size,
+							   int recv_buffer_size,
+							   int backlog)
 	{
 		CHECK_STATE(== SocketState::Closed, false);
 
-		if(
+		if (
 			(
 				Create(type) &&
 				MakeNonBlocking() &&
@@ -41,8 +44,7 @@ namespace ov
 				AddToEpoll(this, static_cast<void *>(this)) &&
 				SetSocketOptions(type, send_buffer_size, recv_buffer_size) &&
 				Bind(address) &&
-				Listen(backlog)
-			) == false)
+				Listen(backlog)) == false)
 		{
 			// 중간 과정에서 오류가 발생하면 실패 반환
 			RemoveFromEpoll(this);
@@ -59,139 +61,39 @@ namespace ov
 		OV_ASSERT2(connection_callback != nullptr);
 		OV_ASSERT2(data_callback != nullptr);
 
+		_connection_callback = connection_callback;
+		_data_callback = data_callback;
+
 		int count = EpollWait(timeout);
 
-		for(int index = 0; index < count; index++)
+		for (int index = 0; index < count; index++)
 		{
 			const epoll_event *event = EpollEvents(index);
 
-			if(event == nullptr)
+			if (event == nullptr)
 			{
-				// 버그가 아닌 이상 nullptr이 될 수 없음
+				// event must be not nullptr
 				OV_ASSERT2(false);
 				return false;
 			}
 
-			void *epoll_data = event->data.ptr;
-			ClientSocket *client_socket = (epoll_data == (void *)this) ? nullptr : static_cast<ClientSocket *>(epoll_data);
+			const void *key = event->data.ptr;
 
-			bool need_to_delete = false;
-
-			if(
-				OV_CHECK_FLAG(event->events, EPOLLERR) ||
-				(!OV_CHECK_FLAG(event->events, EPOLLIN))
-				)
+			if (key == this)
 			{
-				// 오류 발생
-				logte("[%p] [#%d] Epoll error: %p, events: %s (%d)", this, _socket.GetSocket(), epoll_data, StringFromEpollEvent(event).CStr(), event->events);
-
-				if(client_socket != nullptr && (OV_CHECK_FLAG(event->events, EPOLLHUP) || OV_CHECK_FLAG(event->events, EPOLLRDHUP)))
-				{
-					connection_callback(client_socket->GetSharedPtrAs<ClientSocket>(), SocketConnectionState::Disconnected);
-				}
-
-				// client map에서 삭제
-				need_to_delete = true;
-			}
-			else if(OV_CHECK_FLAG(event->events, EPOLLHUP) || OV_CHECK_FLAG(event->events, EPOLLRDHUP))
-			{
-				if(client_socket != nullptr)
-				{
-					logtd("[%p] [#%d] Client #%d is disconnected - events(%s)", this, _socket.GetSocket(), client_socket->GetSocket().GetSocket(), StringFromEpollEvent(event).CStr());
-
-					connection_callback(client_socket->GetSharedPtrAs<ClientSocket>(), SocketConnectionState::Disconnected);
-				}
-				else
-				{
-					OV_ASSERT2(false);
-				}
-
-				// client map에서 삭제
-				need_to_delete = true;
-			}
-			else if(epoll_data == static_cast<void *>(this))
-			{
-				// listen된 socket에서 이벤트 발생
-
-				// listen된 socket에 새로운 클라이언트가 접속함
-				int accept_count = 0;
-				std::shared_ptr<ClientSocket> client = nullptr;
-
-				do
-				{
-					client = Accept();
-
-					if(client != nullptr)
-					{
-						logtd("[%p] [#%d] Client #%d is connected - events(%s)", this, _socket.GetSocket(), client->GetSocket().GetSocket(), StringFromEpollEvent(event).CStr());
-
-						// 정상적으로 accept 되었다면 callback
-						need_to_delete = connection_callback(client, SocketConnectionState::Connected);
-
-						// callback의 반환 값이 true면(need_to_delete = true), 아래에서 client 없앰
-
-						accept_count++;
-					}
-				} while(client != nullptr);
-
-				if(accept_count <= 0 && client_socket != nullptr)
-				{
-					// accept 실패. 아래에서 client 없앰 (정상적인 상황이라면, map 자체에 등록되어 있지 않음)
-					need_to_delete = true;
-				}
+				// A new client is connected to this socket
+				DispatchAccept();
 			}
 			else
 			{
-				// client socket에서 데이터를 읽을 준비가 됨
-
-				auto data = std::make_shared<Data>(TcpBufferSize);
-
-				while(client_socket->GetState() == SocketState::Connected)
-				{
-					data->SetLength(0);
-
-					auto error = client_socket->Recv(data);
-
-					if(data->GetLength() > 0L)
-					{
-						need_to_delete = data_callback(client_socket->GetSharedPtrAs<ClientSocket>(), data);
-						// socket이 error 상태가 되었다면 삭제
-						need_to_delete = need_to_delete || (client_socket->GetState() == SocketState::Error);
-					}
-
-					if(client_socket->GetState() == SocketState::Error)
-					{
-						logtd("[%p] [#%d] An error occurred on client %s", this, _socket.GetSocket(), client_socket->ToString().CStr());
-						connection_callback(client_socket->GetSharedPtrAs<ClientSocket>(), SocketConnectionState::Error);
-						need_to_delete = true;
-						break;
-					}
-
-					if(error != nullptr)
-					{
-						logtd("[%p] [#%d] Client %s is disconnected", this, _socket.GetSocket(), client_socket->ToString().CStr());
-						connection_callback(client_socket->GetSharedPtrAs<ClientSocket>(), SocketConnectionState::Disconnected);
-						need_to_delete = true;
-						break;
-					}
-
-					if(data->GetLength() == 0L)
-					{
-						// 다음 데이터를 기다려야 함
-						break;
-					}
-				}
-			}
-
-			if(need_to_delete)
-			{
-				DisconnectClient(client_socket);
+				// An event raised by the client
+				DispatchEvents(key, event);
 			}
 		}
 
 		// Garbage collection
 		{
-			std::lock_guard<std::mutex> lock(_client_list_mutex);
+			std::lock_guard<std::shared_mutex> lock(_client_list_mutex);
 			_disconnected_client_list.clear();
 		}
 
@@ -200,25 +102,184 @@ namespace ov
 
 	std::shared_ptr<ClientSocket> ServerSocket::Accept()
 	{
-		CHECK_STATE(== SocketState::Listening, nullptr);
+		SocketAddress address;
+		SocketWrapper client_socket = Socket::Accept(&address);
 
-		std::shared_ptr<ClientSocket> client = Socket::AcceptClient<ClientSocket>();
+		if (client_socket.IsValid() == false)
+		{
+			return nullptr;
+		}
 
-		if(client != nullptr)
+		std::shared_ptr<ClientSocket> client = std::make_shared<ClientSocket>(this, client_socket, address);
+
+		if (client != nullptr)
 		{
 			logtd("[%p] [#%d] New client is connected: %s", this, _socket.GetSocket(), client->ToString().CStr());
 
-			_client_list_mutex.lock();
-			_client_list[client.get()] = client;
-			logtd("ADD: Client count: %zu", _client_list.size());
-			_client_list_mutex.unlock();
+			if (client->PrepareSocketOptions())
+			{
+				client->StartDispatchThread();
 
-			AddToEpoll(client.get(), static_cast<void *>(client.get()));
+				_client_list_mutex.lock();
+				_client_list[client.get()] = client;
+				_client_list_mutex.unlock();
 
-			return client;
+				AddToEpoll(client.get(), static_cast<void *>(client.get()));
+
+				return client;
+			}
+			else
+			{
+				logte("[%p] [#%d] Could not prepare socket options: %s", this, _socket.GetSocket(), client->ToString().CStr());
+			}
 		}
 
 		return nullptr;
+	}
+
+	void ServerSocket::DispatchAccept()
+	{
+		while (true)
+		{
+			std::shared_ptr<ClientSocket> client = Accept();
+
+			if (client == nullptr)
+			{
+				break;
+			}
+
+			logtd("[%p] [#%d] Client #%d is connected", this, _socket.GetSocket(), client->GetSocket().GetSocket());
+
+			auto new_state = _connection_callback(client, SocketConnectionState::Connected, nullptr);
+
+			switch (new_state)
+			{
+				case SocketConnectionState::Connected:
+					break;
+
+				case SocketConnectionState::Disconnect:
+					logtd("[%p] [#%d] The connection callback requested to disconnect the client #%d",
+						  this, _socket.GetSocket(), client->GetSocket().GetSocket());
+					DisconnectClient(client, new_state);
+					break;
+
+				case SocketConnectionState::Disconnected:
+					logtd("[%p] [#%d] Invalid socket state for client #%d",
+						  this, _socket.GetSocket(), client->GetSocket().GetSocket());
+					OV_ASSERT2(false);
+					DisconnectClient(client, new_state);
+					break;
+
+				case SocketConnectionState::Error: {
+					auto error = Error::CreateError("Connection", "The connection callback requested to disconnect the client #%d",
+													_socket.GetSocket(), client->GetSocket().GetSocket());
+					logtd("[%p] [#%d] %s", this, _socket.GetSocket(), error->ToString().CStr());
+					DisconnectClient(client, new_state, error);
+					break;
+				}
+			}
+		}
+	}
+
+	void ServerSocket::DispatchEvents(const void *key, const epoll_event *event)
+	{
+		std::shared_ptr<ClientSocket> client = nullptr;
+		uint32_t epoll_events = event->events;
+
+		{
+			std::shared_lock<std::shared_mutex> lock(_client_list_mutex);
+			auto item = _client_list.find(key);
+
+			if (item == _client_list.end())
+			{
+				// If the client deleted from another thread as soon as the event occurs at epoll(), it enters here
+				logtd("[%p] [#%d] Could not find a client: %p", this, _socket.GetSocket(), key);
+				return;
+			}
+
+			client = item->second;
+		}
+
+		if (OV_CHECK_FLAG(epoll_events, EPOLLERR) || (!OV_CHECK_FLAG(epoll_events, EPOLLIN)))
+		{
+			// An error occurred while communiting with the client
+			auto error = Error::CreateError("Epoll", "%s", StringFromEpollEvent(event).CStr());
+			logte("[%p] [#%d] %s", this, _socket.GetSocket(), error->ToString().CStr());
+
+			DisconnectClient(client, SocketConnectionState::Error, error);
+		}
+		else if (OV_CHECK_FLAG(event->events, EPOLLHUP) || OV_CHECK_FLAG(event->events, EPOLLRDHUP))
+		{
+			// The client is disconnected
+			logtd("[%p] [#%d] Client #%d is disconnected with events: %s", this, _socket.GetSocket(), client->GetSocket().GetSocket(), StringFromEpollEvent(event).CStr());
+			DisconnectClient(client, SocketConnectionState::Disconnected);
+		}
+		else
+		{
+			// Data is available that sent by the client
+			auto data = std::make_shared<Data>(TcpBufferSize);
+
+			logtd("[%p] [#%d] The data received from client #%d", this, _socket.GetSocket(), client->GetSocket().GetSocket());
+
+			while (client->GetState() == SocketState::Connected)
+			{
+				data->SetLength(0);
+
+				auto error = client->Recv(data);
+
+				if (data->GetLength() > 0L)
+				{
+					auto new_state = _data_callback(client->GetSharedPtrAs<ClientSocket>(), data);
+					switch (new_state)
+					{
+						case SocketConnectionState::Connected:
+							break;
+
+						case SocketConnectionState::Disconnect:
+							logtd("[%p] [#%d] The data callback requested to disconnect the client #%d",
+								  this, _socket.GetSocket(), client->GetSocket().GetSocket());
+							DisconnectClient(client, new_state);
+							break;
+
+						case SocketConnectionState::Disconnected:
+							logtd("[%p] [#%d] Invalid socket state for client #%d",
+								  this, _socket.GetSocket(), client->GetSocket().GetSocket());
+							OV_ASSERT2(false);
+							DisconnectClient(client, new_state);
+							break;
+
+						case SocketConnectionState::Error: {
+							auto error = Error::CreateError("Connection", "The connection callback requested to disconnect the client #%d",
+															_socket.GetSocket(), client->GetSocket().GetSocket());
+							logtd("[%p] [#%d] %s", this, _socket.GetSocket(), error->ToString().CStr());
+							DisconnectClient(client, new_state, error);
+							break;
+						}
+					}
+				}
+
+				if (client->GetState() == SocketState::Error)
+				{
+					logtd("[%p] [#%d] An error occurred on client %s", this, _socket.GetSocket(), client->ToString().CStr());
+					DisconnectClient(client, SocketConnectionState::Error, error);
+					break;
+				}
+
+				if (error != nullptr)
+				{
+					logtd("[%p] [#%d] Client %s is disconnected", this, _socket.GetSocket(), client->ToString().CStr());
+					DisconnectClient(client, SocketConnectionState::Disconnected, nullptr);
+					break;
+				}
+
+				// TODO(dimiden): (ClientSocketBlocking) Temporarily comment while processing as blocking
+				// if (data->GetLength() == 0L)
+				{
+					// Waiting for next data
+					break;
+				}
+			}
+		}
 	}
 
 	bool ServerSocket::Close()
@@ -227,7 +288,7 @@ namespace ov
 		auto client_list = std::move(_client_list);
 		_client_list_mutex.unlock();
 
-		for(const auto &client : client_list)
+		for (const auto &client : client_list)
 		{
 			client.second->Close();
 		}
@@ -240,9 +301,9 @@ namespace ov
 		return Socket::ToString("ServerSocket");
 	}
 
-	bool ServerSocket::DisconnectClient(ClientSocket *client_socket)
+	bool ServerSocket::DisconnectClient(std::shared_ptr<ClientSocket> client_socket, SocketConnectionState state, const std::shared_ptr<Error> &error)
 	{
-		if(client_socket == nullptr)
+		if (client_socket == nullptr)
 		{
 			OV_ASSERT2(false);
 			return false;
@@ -251,12 +312,13 @@ namespace ov
 		bool remove = false;
 
 		{
-			std::lock_guard<std::mutex> lock(_client_list_mutex);
+			std::lock_guard<std::shared_mutex> lock(_client_list_mutex);
 
-			auto item = _client_list.find(client_socket);
+			auto item = _client_list.find(client_socket.get());
 
-			if(item != _client_list.end())
+			if (item != _client_list.end())
 			{
+				logtd("[%p] [#%d] Deleting the client %s from list...", this, _socket.GetSocket(), client_socket->ToString().CStr());
 				_disconnected_client_list[item->first] = item->second;
 				_client_list.erase(item);
 
@@ -264,23 +326,42 @@ namespace ov
 			}
 			else
 			{
-				logtd("[%d] Could not find socket instance for %s", _socket.GetSocket(), client_socket->ToString().CStr());
+				logtd("[%p] [#%d] Could not find socket instance for %s", this, _socket.GetSocket(), client_socket->ToString().CStr());
 			}
 		}
 
-		if(remove)
+		if (remove)
 		{
-			RemoveFromEpoll(client_socket);
-
-			if(client_socket->GetState() != SocketState::Closed)
+			if (_connection_callback != nullptr)
 			{
-				client_socket->Close();
+				_connection_callback(client_socket->GetSharedPtrAs<ClientSocket>(), state, error);
+			}
+
+			if (RemoveFromEpoll(client_socket.get()))
+			{
+				if (client_socket->GetState() != SocketState::Closed)
+				{
+					return client_socket->CloseInternal();
+				}
 			}
 		}
+		else
+		{
+			return true;
+		}
 
-		logtd("DEL: Client count: %zu", _client_list.size());
+		return false;
+	}
 
-		return true;
+	bool ServerSocket::DisconnectClient(ClientSocket *client_socket, SocketConnectionState state, const std::shared_ptr<Error> &error)
+	{
+		if (client_socket != nullptr)
+		{
+			return DisconnectClient(client_socket->GetSharedPtrAs<ClientSocket>(), state, error);
+		}
+
+		OV_ASSERT2(false);
+		return false;
 	}
 
 	bool ServerSocket::SetSocketOptions(SocketType type, int send_buffer_size, int recv_buffer_size)
@@ -288,40 +369,40 @@ namespace ov
 		// SRT socket is already non-block mode
 		bool result = true;
 
-		if(type == SocketType::Tcp)
+		if (type == SocketType::Tcp)
 		{
 			result &= SetSockOpt<int>(SO_REUSEADDR, 1);
+			// result &= SetSockOpt<int>(IPPROTO_TCP, TCP_NODELAY, 1);
 
-            int current_send_buffer_size;
-            int current_recv_buffer_size;
-            socklen_t data_size = sizeof(int);
+			int current_send_buffer_size;
+			int current_recv_buffer_size;
+			socklen_t data_size = sizeof(int);
 
-            ::getsockopt(_socket.GetSocket(), SOL_SOCKET, SO_SNDBUF,(void*)&current_send_buffer_size, &data_size);
-            ::getsockopt(_socket.GetSocket(), SOL_SOCKET, SO_RCVBUF,(void*)&current_recv_buffer_size, &data_size);
+			::getsockopt(_socket.GetSocket(), SOL_SOCKET, SO_SNDBUF, (void *)&current_send_buffer_size, &data_size);
+			::getsockopt(_socket.GetSocket(), SOL_SOCKET, SO_RCVBUF, (void *)&current_recv_buffer_size, &data_size);
 
+			// Setting send buffer size( 0 = default)
+			if (send_buffer_size != 0 && current_send_buffer_size < send_buffer_size)
+			{
+				// setsockopt function SO_SNDBUF/SO_RCVBUF result is (input value *2)
+				result &= SetSockOpt<int>(SO_SNDBUF, send_buffer_size / 2);
 
-            // Setting send buffer size( 0 = default)
-          	if(send_buffer_size != 0 && current_send_buffer_size < send_buffer_size)
-            {
-                // setsockopt function SO_SNDBUF/SO_RCVBUF result is (input value *2)
-                result &= SetSockOpt<int>(SO_SNDBUF, send_buffer_size/2);
+				::getsockopt(_socket.GetSocket(), SOL_SOCKET, SO_SNDBUF, (void *)&current_send_buffer_size, &data_size);
 
-                ::getsockopt(_socket.GetSocket(), SOL_SOCKET, SO_SNDBUF,(void*)&current_send_buffer_size, &data_size);
+				logtd("TCP Server send buffer size (%u:%u)", current_send_buffer_size, send_buffer_size * 2);
+			}
 
-                logtd("TCP Server send buffer size (%u:%u)", current_send_buffer_size, send_buffer_size*2);
-            }
+			// Setting recv buffer size( 0 = default)
+			if (recv_buffer_size != 0 && current_recv_buffer_size < recv_buffer_size)
+			{
+				// setsockopt function SO_SNDBUF/SO_RCVBUF result is (input value *2)
+				result &= SetSockOpt<int>(SO_RCVBUF, recv_buffer_size / 2);
 
-            // Setting recv buffer size( 0 = default)
-         	if(recv_buffer_size != 0 && current_recv_buffer_size < recv_buffer_size)
-            {
-                // setsockopt function SO_SNDBUF/SO_RCVBUF result is (input value *2)
-                result &= SetSockOpt<int>(SO_RCVBUF, recv_buffer_size/2);
+				socklen_t data_size = sizeof(int);
+				::getsockopt(_socket.GetSocket(), SOL_SOCKET, SO_RCVBUF, (void *)&current_recv_buffer_size, &data_size);
 
-                socklen_t data_size = sizeof(int);
-                ::getsockopt(_socket.GetSocket(), SOL_SOCKET, SO_RCVBUF,(void*)&current_recv_buffer_size, &data_size);
-
-                logtd("TCP Server recv buffer size (%u:%u)",current_recv_buffer_size, recv_buffer_size*2);
-            }
+				logtd("TCP Server recv buffer size (%u:%u)", current_recv_buffer_size, recv_buffer_size * 2);
+			}
 		}
 		else
 		{
@@ -414,4 +495,4 @@ namespace ov
 
 		return result;
 	}
-}
+}  // namespace ov

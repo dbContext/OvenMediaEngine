@@ -8,11 +8,11 @@
 //==============================================================================
 #pragma once
 
-#include "./string.h"
-#include "./error.h"
-#include "./data.h"
+#include <jsoncpp-1.9.3/json/json.h>
 
-#include <jsoncpp-1.8.4/json/json.h>
+#include "./data.h"
+#include "./error.h"
+#include "./string.h"
 
 namespace ov
 {
@@ -25,12 +25,11 @@ namespace ov
 		~JsonObject();
 
 		JsonObject(JsonObject &&object)
-			: _value(object._value)
 		{
-			object._value = Json::Value(Json::ValueType::nullValue);
+			std::swap(_value, object._value);
 		}
 
-		JsonObject(::Json::Value &value)
+		JsonObject(const ::Json::Value &value)
 		{
 			_value = value;
 		}
@@ -42,6 +41,11 @@ namespace ov
 			return JsonObject(null_value);
 		}
 
+		bool IsMember() const noexcept
+		{
+			return _value.asInt();
+		}
+
 		bool IsNull() const noexcept
 		{
 			return _value.isNull();
@@ -50,6 +54,11 @@ namespace ov
 		bool IsArray() const noexcept
 		{
 			return _value.isArray();
+		}
+
+		bool IsString() const noexcept
+		{
+			return _value.isString();
 		}
 
 		bool IsObject() const noexcept
@@ -67,7 +76,7 @@ namespace ov
 		{
 			auto &value = _value[key];
 
-			if(value.isIntegral())
+			if (value.isIntegral())
 			{
 				return value.asInt();
 			}
@@ -79,12 +88,24 @@ namespace ov
 		{
 			auto &value = _value[key];
 
-			if(value.isIntegral())
+			if (value.isIntegral())
 			{
 				return value.asInt64();
 			}
 
 			return 0;
+		}
+
+		String GetStringValue(const ov::String &key) const
+		{
+			auto &value = _value[key];
+
+			if (value.isString())
+			{
+				return ov::String( value.asString().c_str() );
+			}
+
+			return nullptr;			
 		}
 
 		const ::Json::Value &GetJsonValue(const ov::String &key) const
@@ -101,6 +122,12 @@ namespace ov
 
 		std::shared_ptr<Error> Parse(const std::shared_ptr<const Data> &data)
 		{
+			if ((data == nullptr) || (data->GetData() == nullptr))
+			{
+				_value = ::Json::nullValue;
+				return nullptr;
+			}
+
 			return Parse(data->GetData(), data->GetLength());
 		}
 
@@ -108,6 +135,5 @@ namespace ov
 		std::shared_ptr<Error> Parse(const void *data, ssize_t length);
 
 		::Json::Value _value;
-		std::map<ov::String, JsonObject &> _properties;
 	};
-}
+}  // namespace ov

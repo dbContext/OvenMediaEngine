@@ -1,162 +1,131 @@
 #pragma once
 
 #include <utility>
+#include <shared_mutex>
 #include "base/common_types.h"
-#include "base/ovlibrary/string.h"
+#include "base/info/stream.h"
+#include "base/info/session.h"
+#include "base/mediarouter/media_route_application_observer.h"
 #include "base/ovlibrary/semaphore.h"
+#include "base/ovlibrary/string.h"
 #include "config/config.h"
-#include "base/application/stream_info.h"
-#include "base/media_route/media_route_application_observer.h"
 #include "stream.h"
 
-enum ApplicationState
+#define MIN_APPLICATION_WORKER_COUNT		1
+#define MAX_APPLICATION_WORKER_COUNT		72
+
+namespace pub
 {
-	Idle,
-	Started,
-	Stopped,
-	Error
-};
+	enum ApplicationState
+	{
+		Idle,
+		Started,
+		Stopped,
+		Error
+	};
 
-class Application : public info::Application, public MediaRouteApplicationObserver
-{
-public:
-	// MediaRouteApplicationObserver Implementation
-	bool OnCreateStream(std::shared_ptr<StreamInfo> info) override;
-	bool OnDeleteStream(std::shared_ptr<StreamInfo> info) override;
+	class Publisher;
 
-	// Queue에 데이터를 넣는다.
-	bool OnSendVideoFrame(std::shared_ptr<StreamInfo> stream_info,
-	                      std::shared_ptr<MediaTrack> track,
-	                      std::unique_ptr<EncodedFrame> encoded_frame,
-	                      std::unique_ptr<CodecSpecificInfo> codec_info,
-	                      std::unique_ptr<FragmentationHeader> fragmentation) override;
-
-	bool OnSendAudioFrame(std::shared_ptr<StreamInfo> stream_info,
-	                      std::shared_ptr<MediaTrack> track,
-	                      std::unique_ptr<EncodedFrame> encoded_frame,
-	                      std::unique_ptr<CodecSpecificInfo> codec_info,
-	                      std::unique_ptr<FragmentationHeader> fragmentation) override;
-
-	// 수신된 Network Packet을 Application에 넣고 처리를 기다린다.
-	bool PushIncomingPacket(std::shared_ptr<SessionInfo> session_info,
-	                        std::shared_ptr<const ov::Data> data);
-
-	std::shared_ptr<Stream> GetStream(uint32_t stream_id);
-	std::shared_ptr<Stream> GetStream(ov::String stream_name);
-
-protected:
-	explicit Application(const info::Application *application_info);
-	virtual ~Application();
-
-	virtual bool Start();
-	virtual bool Stop();
-
-	// Stream에 VideoFrame을 전송한다.
-	// virtual로 Child에서 원하면 다른 작업을 할 수 있게 한다.
-	virtual void SendVideoFrame(std::shared_ptr<StreamInfo> info,
-	                            std::shared_ptr<MediaTrack> track,
-	                            std::unique_ptr<EncodedFrame> encoded_frame,
-	                            std::unique_ptr<CodecSpecificInfo> codec_info,
-	                            std::unique_ptr<FragmentationHeader> fragmentation);
-
-	virtual void SendAudioFrame(std::shared_ptr<StreamInfo> info,
-	                            std::shared_ptr<MediaTrack> track,
-	                            std::unique_ptr<EncodedFrame> encoded_frame,
-	                            std::unique_ptr<CodecSpecificInfo> codec_info,
-	                            std::unique_ptr<FragmentationHeader> fragmentation);
-
-	virtual void OnPacketReceived(std::shared_ptr<SessionInfo> session_info, std::shared_ptr<const ov::Data> data);
-
-	std::map<uint32_t, std::shared_ptr<Stream>> _streams;
-
-private:
-	void WorkerThread();
-	// For child, 실제 구현부는 자식에서 처리한다.
-
-	// Stream을 자식을 통해 생성해서 받는다.
-	virtual std::shared_ptr<Stream> CreateStream(std::shared_ptr<StreamInfo> info, uint32_t thread_count) = 0;
-	virtual bool DeleteStream(std::shared_ptr<StreamInfo> info) = 0;
-
-	// Audio Stream 전달 Interface를 구현해야 함
-	//virtual void						OnAudioFrame(int32_t stream_id) = 0;
-
-	// Queue에 넣을 정제된 데이터 구조
-	// std::tuple을 이용하려 했으나, return에 nullptr을 사용할 수 없어서 관둠
-	class VideoStreamData
+	// Distribute Stream to ApplicaitonWorker.
+	class ApplicationWorker
 	{
 	public:
-		VideoStreamData(std::shared_ptr<StreamInfo> stream_info,
-		                std::shared_ptr<MediaTrack> track,
-		                std::unique_ptr<EncodedFrame> encoded_frame,
-		                std::unique_ptr<CodecSpecificInfo> codec_info,
-		                std::unique_ptr<FragmentationHeader> fragmentation)
+		ApplicationWorker(uint32_t worker_id, ov::String worker_name);
+		bool Start();
+		bool Stop();
+		bool PushMediaPacket(const std::shared_ptr<Stream> &stream, const std::shared_ptr<MediaPacket> &media_packet);
+		bool PushNetworkPacket(const std::shared_ptr<Session> &session, const std::shared_ptr<const ov::Data> &data);
+
+	private:
+		void WorkerThread();
+
+		uint32_t	_worker_id = 0;
+		ov::String	_worker_name;
+
+		class StreamData
 		{
-			_stream_info = std::move(stream_info);
-			_track = std::move(track);
-			_encoded_frame = std::move(encoded_frame);
-			_codec_info = std::move(codec_info);
-			_framgmentation_header = std::move(fragmentation);
-		}
+		public:
+			StreamData(const std::shared_ptr<Stream> &stream,
+							const std::shared_ptr<MediaPacket> &media_packet)
+			{
+				_stream = stream;
+				_media_packet = media_packet;
+			}
 
-		std::shared_ptr<StreamInfo> _stream_info;
-		std::shared_ptr<MediaTrack> _track;
-		std::unique_ptr<EncodedFrame> _encoded_frame;
-		std::unique_ptr<CodecSpecificInfo> _codec_info;
-		std::unique_ptr<FragmentationHeader> _framgmentation_header;
+			std::shared_ptr<Stream> _stream;
+			std::shared_ptr<MediaPacket> _media_packet;
+		};
+		std::shared_ptr<ApplicationWorker::StreamData> PopStreamData();
+
+		class IncomingPacket
+		{
+		public:
+			IncomingPacket(const std::shared_ptr<Session> &session,
+						   const std::shared_ptr<const ov::Data> &data)
+			{
+				_session = session;
+				_data = data;
+			}
+
+			std::shared_ptr<Session> _session;
+			std::shared_ptr<const ov::Data> _data;
+		};
+		std::shared_ptr<ApplicationWorker::IncomingPacket> PopIncomingPacket();
+
+		bool _stop_thread_flag;
+		std::thread _worker_thread;
+		ov::Semaphore _queue_event;
+
+		ov::Queue<std::shared_ptr<StreamData>> _stream_data_queue;
+		ov::Queue<std::shared_ptr<IncomingPacket>> _incoming_packet_queue;
+
+		int64_t	_last_video_ts_ms = 0;
+		int64_t	_last_audio_ts_ms = 0;
 	};
-	std::unique_ptr<Application::VideoStreamData> PopVideoStreamData();
 
-	class AudioStreamData
+	class Application : public info::Application, public MediaRouteApplicationObserver
 	{
 	public:
-		AudioStreamData(std::shared_ptr<StreamInfo> stream_info,
-		                std::shared_ptr<MediaTrack> track,
-		                std::unique_ptr<EncodedFrame> encoded_frame,
-		                std::unique_ptr<CodecSpecificInfo> codec_info,
-		                std::unique_ptr<FragmentationHeader> fragmentation)
-		{
-			_stream_info = std::move(stream_info);
-			_track = std::move(track);
-			_encoded_frame = std::move(encoded_frame);
-			_codec_info = std::move(codec_info);
-			_framgmentation_header = std::move(fragmentation);
-		}
+		const char* GetApplicationTypeName() final;
 
-		std::shared_ptr<StreamInfo> _stream_info;
-		std::shared_ptr<MediaTrack> _track;
-		std::unique_ptr<EncodedFrame> _encoded_frame;
-		std::unique_ptr<CodecSpecificInfo> _codec_info;
-		std::unique_ptr<FragmentationHeader> _framgmentation_header;
+		// MediaRouteApplicationObserver Implementation
+		bool OnStreamCreated(const std::shared_ptr<info::Stream> &info) override;
+		bool OnStreamDeleted(const std::shared_ptr<info::Stream> &info) override;
+		bool OnStreamPrepared(const std::shared_ptr<info::Stream> &info) override;
+
+		// Put data in ApplicationWorker's queue.
+		bool OnSendFrame(const std::shared_ptr<info::Stream> &stream,
+							  const std::shared_ptr<MediaPacket> &media_packet) override;
+
+		// Put packet in ApplicationWorker's queue.
+		bool PushIncomingPacket(const std::shared_ptr<info::Session> &session_info,
+								const std::shared_ptr<const ov::Data> &data);
+
+		uint32_t GetStreamCount();
+		std::shared_ptr<Stream> GetStream(uint32_t stream_id);
+		std::shared_ptr<Stream> GetStream(ov::String stream_name);
+
+		virtual bool Start();
+		virtual bool Stop();
+
+	protected:
+		explicit Application(const std::shared_ptr<Publisher> &publisher, const info::Application &application_info);
+		virtual ~Application();
+
+		std::shared_mutex 		_stream_map_mutex;
+		std::map<uint32_t, std::shared_ptr<Stream>> _streams;
+
+	private:
+		bool DeleteAllStreams();
+		virtual std::shared_ptr<Stream> CreateStream(const std::shared_ptr<info::Stream> &info, uint32_t thread_count) = 0;
+		virtual bool DeleteStream(const std::shared_ptr<info::Stream> &info) = 0;
+		
+		std::shared_ptr<ApplicationWorker> GetWorkerByStreamID(info::stream_id_t stream_id);
+
+		uint32_t		_application_worker_count;
+		std::shared_mutex _application_worker_lock;
+		std::vector<std::shared_ptr<ApplicationWorker>>	_application_workers;
+
+		std::shared_ptr<Publisher>		_publisher;
 	};
-	std::unique_ptr<Application::AudioStreamData> PopAudioStreamData();
-
-	class IncomingPacket
-	{
-	public:
-		IncomingPacket(std::shared_ptr<SessionInfo> session_info, std::shared_ptr<const ov::Data> data)
-		{
-			_session_info = std::move(session_info);
-			_data = std::move(data);
-		}
-
-		std::shared_ptr<SessionInfo> _session_info;
-		std::shared_ptr<const ov::Data> _data;
-	};
-	std::unique_ptr<Application::IncomingPacket> PopIncomingPacket();
-
-	bool _stop_thread_flag;
-	std::thread _worker_thread;
-	ov::Semaphore _queue_event;
-
-	std::queue<std::unique_ptr<VideoStreamData>> _video_stream_queue;
-	std::mutex _video_stream_queue_guard;
-
-	std::queue<std::unique_ptr<AudioStreamData>> _audio_stream_queue;
-	std::mutex _audio_stream_queue_guard;
-
-	std::queue<std::unique_ptr<IncomingPacket>> _incoming_packet_queue;
-	std::mutex _incoming_packet_queue_guard;
-
-	//std::queue<std::unique_ptr<AudioStreamData>>	_audio_stream_queue;
-
-};
+}  // namespace pub

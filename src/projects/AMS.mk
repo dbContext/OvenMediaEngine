@@ -16,10 +16,10 @@ PROJECT_CFLAGS := \
 PROJECT_CXXFLAGS := \
 	$(PROJECT_CFLAGS) \
 	-Wliteral-suffix \
-	-std=c++14
+	-std=c++17
 
 PROJECT_LDFLAGS := \
-	-ldl -lz -lopenh264
+	-ldl -lz
 
 include $(CLEAR_VARIABLES)
 include $(BUILD_SUB_AMS)

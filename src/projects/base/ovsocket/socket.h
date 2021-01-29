@@ -10,19 +10,67 @@
 
 #include "socket_address.h"
 
-#include <sys/socket.h>
-#include <sys/epoll.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
+#if defined(__APPLE__)
+#include <sys/event.h>
 
-#include <utility>
-#include <memory>
-#include <map>
+typedef union epoll_data {
+	void    *ptr;
+	int      fd;
+	uint32_t u32;
+	uint64_t u64;
+} epoll_data_t;
+
+struct epoll_event {
+	uint32_t		events;
+	epoll_data_t	data;
+};
+
+static inline int epoll_create1(int)
+{
+	return kqueue();
+}
+
+// epoll_ctl flags
+constexpr int EPOLL_CTL_ADD = 1;
+constexpr int EPOLL_CTL_DEL = 2;
+
+// epoll_event event values
+constexpr int EPOLLIN  		= 0x0001;
+constexpr int EPOLLOUT		= 0x0002;
+constexpr int EPOLLHUP 		= 0x0004;
+constexpr int EPOLLERR 		= 0x0008;
+constexpr int EPOLLRDHUP 	= 0x0010;
+constexpr int EPOLLPRI		= 0x0020;
+constexpr int EPOLLRDNORM	= 0x0040;
+constexpr int EPOLLRDBAND	= 0x0080;
+constexpr int EPOLLWRNORM	= 0x0100;
+constexpr int EPOLLWRBAND	= 0x0200;
+constexpr int EPOLLMSG		= 0x0400;
+constexpr int EPOLLWAKEUP	= 0x0800;
+constexpr int EPOLLONESHOT	= 0x1000;
+constexpr int EPOLLET		= 0x2000;
+
+int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event);
+int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout);
+
+// macOS does not have a MSG_NOSIGNAL, has a SO_NOSIGPIPE, need to test to understand equality
+#define MSG_NOSIGNAL 0x2000
+#else
+#include <sys/epoll.h>
+#endif
+#include <sys/socket.h>
+
 #include <functional>
+#include <map>
+#include <memory>
+#include <utility>
 
 // for SRT
-#include <srt/srt.h>
-
 #include <base/ovlibrary/ovlibrary.h>
+#include <base/ovlibrary/semaphore.h>
+#include <srt/srt.h>
 
 namespace ov
 {
@@ -43,6 +91,25 @@ namespace ov
 		Tcp,
 		Srt
 	};
+
+	static const char *StringFromSocketType(SocketType type)
+	{
+		switch (type)
+		{
+			case SocketType::Udp:
+				return "UDP";
+
+			case SocketType::Tcp:
+				return "TCP";
+
+			case SocketType::Srt:
+				return "SRT";
+
+			case SocketType::Unknown:
+			default:
+				return "Unknown";
+		}
+	}
 
 	enum class SocketState : char
 	{
@@ -65,9 +132,9 @@ namespace ov
 			SetSocket(type, sock);
 		}
 
-		bool operator ==(const int &sock) const
+		bool operator==(const int &sock) const
 		{
-			switch(_type)
+			switch (_type)
 			{
 				case SocketType::Tcp:
 				case SocketType::Udp:
@@ -81,14 +148,14 @@ namespace ov
 			}
 		}
 
-		bool operator !=(const int &sock) const
+		bool operator!=(const int &sock) const
 		{
-			return !operator ==(sock);
+			return !operator==(sock);
 		}
 
 		int GetSocket() const
 		{
-			switch(_type)
+			switch (_type)
 			{
 				case SocketType::Tcp:
 				case SocketType::Udp:
@@ -104,13 +171,13 @@ namespace ov
 
 		void SetSocket(SocketType type, int sock)
 		{
-			switch(type)
+			switch (type)
 			{
 				case SocketType::Tcp:
 				case SocketType::Udp:
 					_socket.socket = sock;
 
-					if(sock != InvalidSocket)
+					if (sock != InvalidSocket)
 					{
 						_type = type;
 						_valid = true;
@@ -120,7 +187,7 @@ namespace ov
 				case SocketType::Srt:
 					_socket.srt_socket = sock;
 
-					if(sock != SRT_INVALID_SOCK)
+					if (sock != SRT_INVALID_SOCK)
 					{
 						_type = type;
 						_valid = true;
@@ -142,6 +209,11 @@ namespace ov
 			_valid = valid;
 		}
 
+		void Invalidate()
+		{
+			SetSocket(_type, (_type == SocketType::Srt) ? SRT_INVALID_SOCK : InvalidSocket);
+		}
+
 		const bool IsValid() const noexcept
 		{
 			return _valid;
@@ -152,7 +224,7 @@ namespace ov
 			return _type;
 		}
 
-		SocketWrapper &operator =(const SocketWrapper &wrapper) = default;
+		SocketWrapper &operator=(const SocketWrapper &wrapper) = default;
 
 	protected:
 		SocketType _type = SocketType::Unknown;
@@ -162,7 +234,7 @@ namespace ov
 		{
 			socket_t socket;
 			SRTSOCKET srt_socket;
-		} _socket { InvalidSocket };
+		} _socket{InvalidSocket};
 	};
 
 	class Socket : public EnableSharedFromThis<Socket>
@@ -175,56 +247,57 @@ namespace ov
 		Socket(Socket &&socket) noexcept;
 		virtual ~Socket();
 
-		bool Create(SocketType type);
-		bool MakeNonBlocking();
+		virtual bool Create(SocketType type);
+		virtual bool MakeNonBlocking();
 
-		bool Bind(const SocketAddress &address);
+		virtual bool Bind(const SocketAddress &address);
+		virtual bool Listen(int backlog = SOMAXCONN);
+		virtual SocketWrapper Accept(SocketAddress *client);
+		virtual std::shared_ptr<ov::Error> Connect(const SocketAddress &endpoint, int timeout = Infinite);
 
-		bool Listen(int backlog = SOMAXCONN);
+		virtual bool SetRecvTimeout(timeval &tv);
 
-		template<typename T>
-		std::shared_ptr<T> AcceptClient()
-		{
-			SocketAddress client;
-			SocketWrapper client_socket = AcceptClientInternal(&client);
-
-			if(client_socket.IsValid())
-			{
-				// Accept()는 TCP에서만 일어남
-				return std::make_shared<T>(client_socket, client);
-			}
-
-			return nullptr;
-		}
-
-		std::shared_ptr<ov::Error> Connect(const SocketAddress &endpoint, int timeout = Infinite);
-
-		bool PrepareEpoll();
-		bool AddToEpoll(Socket *socket, void *parameter);
-		int EpollWait(int timeout = Infinite);
-		const epoll_event *EpollEvents(int index);
-		bool RemoveFromEpoll(Socket *socket);
+		virtual bool PrepareEpoll();
+		virtual bool AddToEpoll(Socket *socket, void *parameter);
+		virtual int EpollWait(int timeout = Infinite);
+		virtual const epoll_event *EpollEvents(int index);
+		virtual bool RemoveFromEpoll(Socket *socket);
 
 		std::shared_ptr<SocketAddress> GetLocalAddress() const;
 		std::shared_ptr<SocketAddress> GetRemoteAddress() const;
 
 		// for normal socket
-		template<class T>
-		bool SetSockOpt(int option, const T &value)
+		template <class T>
+		bool SetSockOpt(int proto, int option, const T &value)
 		{
-			return SetSockOpt(option, &value, (socklen_t)sizeof(T));
+			return SetSockOpt(proto, option, &value, (socklen_t)sizeof(T));
 		}
 
-		bool SetSockOpt(int option, const void *value, socklen_t value_length);
+		template <class T>
+		bool SetSockOpt(int option, const T &value)
+		{
+			return SetSockOpt<T>(SOL_SOCKET, option, value);
+		}
+
+		virtual bool SetSockOpt(int proto, int option, const void *value, socklen_t value_length);
+		virtual bool SetSockOpt(int option, const void *value, socklen_t value_length);
+
+		template <class T>
+		bool GetSockOpt(int option, T *value) const
+		{
+			return GetSockOpt(SOL_SOCKET, option, value, (socklen_t)sizeof(T));
+		}
+
+		virtual bool GetSockOpt(int proto, int option, void *value, socklen_t value_length) const;
 
 		// for SRT
-		template<class T>
+		template <class T>
 		bool SetSockOpt(SRT_SOCKOPT option, const T &value)
 		{
 			return SetSockOpt(option, &value, static_cast<int>(sizeof(T)));
 		}
 
-		bool SetSockOpt(SRT_SOCKOPT option, const void *value, int value_length);
+		virtual bool SetSockOpt(SRT_SOCKOPT option, const void *value, int value_length);
 
 		// 현재 소켓의 접속 상태
 		SocketState GetState() const;
@@ -236,41 +309,49 @@ namespace ov
 			return _socket;
 		}
 
+		int GetId() const
+		{
+			return _socket.GetSocket();
+		}
+
 		// 소켓 타입
 		SocketType GetType() const;
 
 		// 데이터 송신
 		virtual ssize_t Send(const void *data, size_t length);
 		virtual ssize_t Send(const std::shared_ptr<const Data> &data);
-        virtual ssize_t Send(const void *data, size_t length, bool &is_retry);
 
 		virtual ssize_t SendTo(const ov::SocketAddress &address, const void *data, size_t length);
 		virtual ssize_t SendTo(const ov::SocketAddress &address, const std::shared_ptr<const Data> &data);
 
-		virtual // 데이터 수신
+		// 데이터 수신
 		// 최대 ByteData의 capacity만큼 데이터를 기록
 		// false가 반환되면 error를 체크해야 함
-		std::shared_ptr<ov::Error> Recv(std::shared_ptr<Data> &data);
+		virtual std::shared_ptr<ov::Error> Recv(std::shared_ptr<Data> &data);
+		virtual std::shared_ptr<ov::Error> Recv(void *data, size_t length, size_t *received_length, bool non_block=false);
 
-		virtual // 최대 ByteData의 capacity만큼 데이터를 기록
+		// 최대 ByteData의 capacity만큼 데이터를 기록
 		// nullptr이 반환되면 errno를 체크해야 함
-		std::shared_ptr<ov::Error> RecvFrom(std::shared_ptr<Data> &data, std::shared_ptr<ov::SocketAddress> *address);
+		virtual std::shared_ptr<ov::Error> RecvFrom(std::shared_ptr<Data> &data, std::shared_ptr<ov::SocketAddress> *address);
 
 		// 소켓을 닫음
 		virtual bool Close();
 
+		virtual String GetStat() const;
 		virtual String ToString() const;
 
 	protected:
-		SocketWrapper AcceptClientInternal(SocketAddress *client);
-
 		// utility method
 		static String StringFromEpollEvent(const epoll_event *event);
 		static String StringFromEpollEvent(const epoll_event &event);
 
+		ssize_t SendInternal(const void *data, size_t length);
+		std::shared_ptr<ov::Error> RecvInternal(void *data, size_t length, size_t *received_length);
+		
 		virtual String ToString(const char *class_name) const;
 
-	protected:
+		virtual bool CloseInternal();
+
 		SocketWrapper _socket;
 
 		SocketState _state = SocketState::Closed;
@@ -288,5 +369,7 @@ namespace ov
 		int _srt_epoll = SRT_INVALID_SOCK;
 		epoll_event *_epoll_events = nullptr;
 		int _last_epoll_event_count = 0;
+
+		volatile bool _force_stop = false;
 	};
-}
+}  // namespace ov

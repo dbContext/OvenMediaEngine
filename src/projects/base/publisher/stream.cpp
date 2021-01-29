@@ -1,257 +1,387 @@
-#include "publisher_private.h"
 #include "stream.h"
+#include "application.h"
+#include "publisher_private.h"
 
-StreamWorker::StreamWorker()
+namespace pub
 {
-	_stop_thread_flag = true;
-}
-
-StreamWorker::~StreamWorker()
-{
-	Stop();
-}
-
-bool StreamWorker::Start()
-{
-	if(!_stop_thread_flag)
+	StreamWorker::StreamWorker(const std::shared_ptr<Stream> &parent_stream)
+		: _packet_queue(nullptr, 500)
 	{
-		return true;
-	}
-	_stop_thread_flag = false;
-	_worker_thread = std::thread(&StreamWorker::WorkerThread, this);
-
-	return true;
-}
-
-bool StreamWorker::Stop()
-{
-	if(_stop_thread_flag)
-	{
-		return true;
+		_stop_thread_flag = true;
+		_parent = parent_stream;
 	}
 
-	_stop_thread_flag = true;
-	// Generate Event
-	_queue_event.Notify();
-	_worker_thread.join();
-
-	for(auto const &x : _sessions)
+	StreamWorker::~StreamWorker()
 	{
-		auto session = std::static_pointer_cast<Session>(x.second);
-		session->Stop();
-	}
-	_sessions.clear();
-
-	return true;
-}
-
-bool StreamWorker::AddSession(std::shared_ptr<Session> session)
-{
-	std::unique_lock<std::mutex> lock(_session_map_guard);
-	_sessions[session->GetId()] = session;
-
-	return true;
-}
-
-bool StreamWorker::RemoveSession(session_id_t id)
-{
-	// 해당 Session ID를 가진 StreamWorker를 찾아서 삭제한다.
-	std::unique_lock<std::mutex> lock(_session_map_guard);
-	if(_sessions.count(id) <= 0)
-	{
-		logte("Cannot find session : %u", id);
-		return false;
+		Stop();
 	}
 
-	auto session = _sessions[id];
-	// Session에 더이상 패킷을 전달하지 않는 것이 먼저다.
-	_sessions.erase(id);
-
-	// Session 동작을 중지한다.
-	session->Stop();
-
-	return true;
-}
-
-std::shared_ptr<Session> StreamWorker::GetSession(session_id_t id)
-{
-	if(_sessions.count(id) <= 0)
+	bool StreamWorker::Start()
 	{
-        logte("Cannot find session : %u", id);
-		return nullptr;
-	}
-
-	return _sessions[id];
-}
-
-void StreamWorker::SendPacket(uint32_t type, std::shared_ptr<ov::Data> packet)
-{
-	// Queue에 패킷을 집어넣는다.
-	auto stream_packet = std::make_shared<StreamWorker::StreamPacket>(type, packet);
-
-	std::unique_lock<std::mutex> lock(_packet_queue_guard);
-	_packet_queue.push(stream_packet);
-	lock.unlock();
-
-	_queue_event.Notify();
-}
-
-std::shared_ptr<StreamWorker::StreamPacket> StreamWorker::PopStreamPacket()
-{
-	std::unique_lock<std::mutex> lock(_packet_queue_guard);
-
-	if(_packet_queue.empty())
-	{
-		return nullptr;
-	}
-
-	auto data = _packet_queue.front();
-	_packet_queue.pop();
-
-	return std::move(data);
-}
-
-void StreamWorker::WorkerThread()
-{
-	std::unique_lock<std::mutex> session_lock(_session_map_guard, std::defer_lock);
-	// Queue Event를 기다린다.
-	while(!_stop_thread_flag)
-	{
-		// Queue에 이벤트가 들어올때까지 무한 대기 한다.
-		// TODO: 향후 App 재시작 등의 기능을 위해 WaitFor(time) 기능을 구현한다.
-		_queue_event.Wait();
-
-		// Queue에서 패킷을 꺼낸다.
-		std::shared_ptr<StreamWorker::StreamPacket> packet = PopStreamPacket();
-		if(packet == nullptr)
+		if (!_stop_thread_flag)
 		{
-			continue;
+			return true;
 		}
 
-		session_lock.lock();
-		// 모든 Session에 전송한다.
-		for(auto const &x : _sessions)
+		ov::String queue_name;
+
+		queue_name.Format("%s/%s/%s StreamWorker Queue", _parent->GetApplicationTypeName(), _parent->GetApplicationName(), _parent->GetName().CStr());
+		_packet_queue.SetAlias(queue_name.CStr());
+		
+		_stop_thread_flag = false;
+		_worker_thread = std::thread(&StreamWorker::WorkerThread, this);
+		pthread_setname_np(_worker_thread.native_handle(), "StreamWorker");
+
+		return true;
+	}
+
+	bool StreamWorker::Stop()
+	{
+		if (_stop_thread_flag)
+		{
+			return true;
+		}
+
+		_stop_thread_flag = true;
+		// Generate Event
+		_packet_queue.Stop();
+		_queue_event.Notify();
+		if(_worker_thread.joinable())
+		{
+			_worker_thread.join();
+		}
+
+		std::lock_guard<std::shared_mutex> lock(_session_map_mutex);
+		for (auto const &x : _sessions)
 		{
 			auto session = std::static_pointer_cast<Session>(x.second);
-
-			// Session will change data
-			std::shared_ptr<ov::Data> session_data = packet->_data->Clone();
-			session->SendOutgoingData(packet->_type, session_data);
+			session->Stop();
 		}
-		session_lock.unlock();
-	}
-}
+		_sessions.clear();
 
-Stream::Stream(const std::shared_ptr<Application> application,
-               const StreamInfo &info)
-	: StreamInfo(info)
-{
-	_application = application;
-	_run_flag = false;
-}
-
-Stream::~Stream()
-{
-	Stop();
-}
-
-bool Stream::Start(uint32_t worker_count)
-{
-	if(_run_flag == true)
-	{
-		return false;
+		return true;
 	}
 
-	if(worker_count > MAX_STREAM_THREAD_COUNT)
+	bool StreamWorker::AddSession(std::shared_ptr<Session> session)
 	{
-		worker_count = MAX_STREAM_THREAD_COUNT;
-	}
-
-	_worker_count = worker_count;
-	// Create WorkerThread
-	for(uint32_t i=0; i<_worker_count; i++)
-	{
-		if(!_stream_workers[i].Start())
+		// Cannot add session after StreamWorker is stopped
+		if (_stop_thread_flag)
 		{
-			logte("Cannot create stream thread (%d)", i);
+			return true;
+		}
 
-			Stop();
+		std::lock_guard<std::shared_mutex> lock(_session_map_mutex);
+		_sessions[session->GetId()] = session;
 
+		return true;
+	}
+
+	bool StreamWorker::RemoveSession(session_id_t id)
+	{
+		// Cannot remove session after StreamWorker is stopped
+		if (_stop_thread_flag)
+		{
+			return true;
+		}
+
+		std::unique_lock<std::shared_mutex> lock(_session_map_mutex);
+		if (_sessions.count(id) <= 0)
+		{
+			logte("Cannot find session : %u", id);
 			return false;
 		}
+
+		auto session = _sessions[id];
+		_sessions.erase(id);
+		lock.unlock();
+
+		session->Stop();
+
+		return true;
 	}
 
-	_run_flag = true;
-	return true;
-}
-
-bool Stream::Stop()
-{
-	if(_run_flag == false)
+	std::shared_ptr<Session> StreamWorker::GetSession(session_id_t id)
 	{
-		return false;
+		std::shared_lock<std::shared_mutex> lock(_session_map_mutex);
+		if (_sessions.count(id) <= 0)
+		{
+			// logte("Cannot find session : %u", id);
+			return nullptr;
+		}
+
+		return _sessions[id];
 	}
 
-	_run_flag = false;
-
-	for(uint32_t i=0; i<_worker_count; i++)
+	void StreamWorker::SendPacket(const std::any &packet)
 	{
-		_stream_workers[i].Stop();
+		_packet_queue.Enqueue(packet);
+		_queue_event.Notify();
 	}
 
-	_sessions.clear();
-
-	return true;
-}
-
-std::shared_ptr<Application> Stream::GetApplication()
-{
-	return _application;
-}
-
-StreamWorker& Stream::GetWorkerByStreamID(session_id_t session_id)
-{
-	return _stream_workers[session_id % _worker_count];
-}
-
-bool Stream::AddSession(std::shared_ptr<Session> session)
-{
-	// For getting session, all sessions
-	_sessions[session->GetId()] = session;
-	// 가장 적은 Session을 처리하는 Worker를 찾아서 Session을 넣는다.
-	// session id로 hash를 만들어서 분배한다.
-	return GetWorkerByStreamID(session->GetId()).AddSession(session);
-}
-
-bool Stream::RemoveSession(session_id_t id)
-{
-	if(_sessions.count(id) <= 0)
+	std::any StreamWorker::PopStreamPacket()
 	{
-		logte("Cannot find session : %u", id);
-		return false;
+		if (_packet_queue.IsEmpty())
+		{
+			return nullptr;
+		}
+
+		auto data = _packet_queue.Dequeue();
+		if(data.has_value())
+		{
+			return data.value();
+		}
+
+		return nullptr;
 	}
-	_sessions.erase(id);
 
-	return GetWorkerByStreamID(id).RemoveSession(id);
-}
-
-std::shared_ptr<Session> Stream::GetSession(session_id_t id)
-{
-	return GetWorkerByStreamID(id).GetSession(id);
-}
-
-const std::map<session_id_t, std::shared_ptr<Session>> &Stream::GetAllSessions()
-{
-	return _sessions;
-}
-
-bool Stream::BroadcastPacket(uint32_t packet_type, std::shared_ptr<ov::Data> packet)
-{
-	// 모든 StreamWorker에 나눠준다.
-	for(uint32_t i=0; i<_worker_count; i++)
+	void StreamWorker::WorkerThread()
 	{
-		_stream_workers[i].SendPacket(packet_type, packet);
+		std::shared_lock<std::shared_mutex> session_lock(_session_map_mutex, std::defer_lock);
+
+		while (!_stop_thread_flag)
+		{
+			_queue_event.Wait();
+
+			auto packet = PopStreamPacket();
+			if (!packet.has_value())
+			{
+				continue;
+			}
+			
+			session_lock.lock();
+			for (auto const &x : _sessions)
+			{
+				auto session = std::static_pointer_cast<Session>(x.second);
+				session->SendOutgoingData(packet);
+			}
+			session_lock.unlock();
+		}
 	}
 
-	return true;
-}
+	Stream::Stream(const std::shared_ptr<Application> application, const info::Stream &info)
+		: info::Stream(info)
+	{
+		_application = application;
+		_last_issued_session_id = 100;
+		_state = State::CREATED;
+	}
+
+	Stream::~Stream()
+	{
+		Stop();
+	}
+
+	bool Stream::Start()
+	{
+		if (_state != State::CREATED)
+		{
+			return false;
+		}
+
+		logti("%s application has started [%s(%u)] stream", GetApplicationTypeName(), GetName().CStr(), GetId());
+		_state = State::STARTED;
+		return true;
+	}
+
+	bool Stream::WaitUntilStart(uint32_t timeout_ms)
+	{
+		ov::StopWatch	watch;
+		
+		watch.Start();
+
+		while(_state != State::STARTED && watch.Elapsed() < timeout_ms)
+		{
+			usleep(100 * 1000); // 100ms
+		}
+
+		return _state == State::STARTED;
+	}
+
+	bool Stream::CreateStreamWorker(uint32_t worker_count)
+	{
+		std::unique_lock<std::shared_mutex> worker_lock(_stream_worker_lock);
+		
+		if (worker_count > MAX_STREAM_WORKER_THREAD_COUNT)
+		{
+			worker_count = MAX_STREAM_WORKER_THREAD_COUNT;
+		}
+
+		_worker_count = worker_count;
+		// Create WorkerThread
+		for (uint32_t i = 0; i < _worker_count; i++)
+		{
+			auto stream_worker = std::make_shared<StreamWorker>(GetSharedPtr());
+						
+			if (stream_worker->Start() == false)
+			{
+				logte("Cannot create stream thread (%d)", i);
+				Stop();
+
+				return false;
+			}
+
+			_stream_workers.push_back(stream_worker);
+		}
+
+		worker_lock.unlock();
+
+		return true;
+	}
+
+	bool Stream::Stop()
+	{
+		std::unique_lock<std::shared_mutex> worker_lock(_stream_worker_lock);
+
+		if (_state != State::STARTED)
+		{
+			return false;
+		}
+
+		_state = State::STOPPED;
+
+		for(const auto &worker : _stream_workers)
+		{
+			worker->Stop();
+		}
+
+		_stream_workers.clear();
+
+		worker_lock.unlock();
+
+		std::lock_guard<std::shared_mutex> session_lock(_session_map_mutex);
+		for(const auto &x : _sessions)
+		{
+			auto session = x.second;
+			session->Stop();
+		}
+		_sessions.clear();
+
+		logti("[%s(%u)] %s stream has been stopped", GetName().CStr(), GetId(), GetApplicationTypeName());
+
+		return true;
+	}
+
+	std::shared_ptr<Application> Stream::GetApplication()
+	{
+		return _application;
+	}
+
+	const char * Stream::GetApplicationTypeName()
+	{
+		if(GetApplication() == nullptr)
+		{
+			return "Unknown";
+		}
+
+		return GetApplication()->GetApplicationTypeName();
+	}
+
+	std::shared_ptr<StreamWorker> Stream::GetWorkerBySessionID(session_id_t session_id)
+	{
+		if(_worker_count == 0)
+		{
+			return nullptr;
+		}
+		std::shared_lock<std::shared_mutex> worker_lock(_stream_worker_lock);
+		return _stream_workers[session_id % _worker_count];
+	}
+
+	bool Stream::AddSession(std::shared_ptr<Session> session)
+	{
+		std::lock_guard<std::shared_mutex> session_lock(_session_map_mutex);
+		// For getting session, all sessions
+		_sessions[session->GetId()] = session;
+
+		if(_worker_count > 0)
+		{
+			return GetWorkerBySessionID(session->GetId())->AddSession(session);
+		}
+
+		return true;
+	}
+
+	bool Stream::RemoveSession(session_id_t id)
+	{
+		std::unique_lock<std::shared_mutex> session_lock(_session_map_mutex);
+		if (_sessions.count(id) <= 0)
+		{
+			logte("Cannot find session : %u", id);
+			return false;
+		}
+		_sessions.erase(id);
+		session_lock.unlock();
+
+		if(_worker_count > 0)
+		{
+			return GetWorkerBySessionID(id)->RemoveSession(id);
+		}
+
+		return true;
+	}
+
+	std::shared_ptr<Session> Stream::GetSession(session_id_t id)
+	{
+		std::shared_lock<std::shared_mutex> session_lock(_session_map_mutex);
+		if (_sessions.count(id) <= 0)
+		{
+			return nullptr;
+		}
+
+		return _sessions[id];
+	}
+
+	const std::map<session_id_t, std::shared_ptr<Session>> Stream::GetAllSessions()
+	{
+		std::shared_lock<std::shared_mutex> session_lock(_session_map_mutex);
+		return _sessions;
+	}
+
+	uint32_t Stream::GetSessionCount()
+	{
+		std::shared_lock<std::shared_mutex> session_lock(_session_map_mutex);
+		return _sessions.size();
+	}
+
+	bool Stream::BroadcastPacket(const std::any &packet)
+	{
+		if(_worker_count > 0)
+		{
+			std::shared_lock<std::shared_mutex> worker_lock(_stream_worker_lock);
+			for (uint32_t i = 0; i < _stream_workers.size(); i++)
+			{
+				_stream_workers[i]->SendPacket(packet);
+			}
+		}
+		else
+		{
+			std::shared_lock<std::shared_mutex> session_lock(_session_map_mutex);
+			for (auto const &x : _sessions)
+			{
+				auto session = std::static_pointer_cast<Session>(x.second);
+				session->SendOutgoingData(packet);
+			}
+		}
+	
+		return true;
+	}
+
+	uint32_t Stream::IssueUniqueSessionId()
+	{
+		auto new_session_id = _last_issued_session_id++;
+
+		while (true)
+		{
+			if (_sessions.find(new_session_id) == _sessions.end())
+			{
+				// not found
+				break;
+			}
+
+			new_session_id++;
+		}
+
+		_last_issued_session_id = new_session_id;
+
+		return new_session_id;
+	}
+}  // namespace pub

@@ -1,112 +1,152 @@
+//==============================================================================
+//
+//  OvenMediaEngine
+//
+//  Created by Getroot
+//  Copyright (c) 2018 AirenSoft. All rights reserved.
+//
+//==============================================================================
 #pragma once
 
 #include <base/common_types.h>
+#include <base/info/host.h>
+#include <base/mediarouter/media_route_application_observer.h>
 #include <base/ovcrypto/ovcrypto.h>
 #include <base/publisher/application.h>
 #include <base/publisher/stream.h>
-#include <base/media_route/media_route_application_observer.h>
 
-#include <physical_port/physical_port.h>
-#include <ice/ice_port_manager.h>
+#include <modules/ice/ice_port_manager.h>
+#include <modules/physical_port/physical_port.h>
+
+#include <orchestrator/data_structures/data_structure.h>
+
+#include <modules/signature/signature_common_type.h>
+#include <modules/signature/signed_policy.h>
+#include <modules/signature/signed_token.h>
 
 #include <chrono>
 
-//====================================================================================================
-// Monitoring Collect Data
-//====================================================================================================
-enum class MonitroingCollectionType
+namespace pub
 {
-    Stream = 0,
-    App,
-    Origin,
-    Host,
-};
+	//====================================================================================================
+	// Monitoring Collect Data
+	//====================================================================================================
+	enum class MonitroingCollectionType
+	{
+		Stream = 0,
+		App,
+		Origin,
+		Host,
+	};
 
-struct MonitoringCollectionData
-{
-    MonitoringCollectionData() = default;
+	struct MonitoringCollectionData
+	{
+		MonitoringCollectionData() = default;
 
-    MonitoringCollectionData(MonitroingCollectionType type_,
-                           const ov::String &origin_name_ = "",
-                            const ov::String &app_name_ = "",
-                            const ov::String &stream_name_ = "")
-    {
-        type = type_;
-        type_string = GetTypeString(type);
-        origin_name = origin_name_;
-        app_name = app_name_;
-        stream_name = stream_name_;
-    }
+		MonitoringCollectionData(MonitroingCollectionType type_,
+								 const ov::String &origin_name_ = "",
+								 const ov::String &app_name_ = "",
+								 const ov::String &stream_name_ = "")
+		{
+			type = type_;
+			type_string = GetTypeString(type);
+			origin_name = origin_name_;
+			app_name = app_name_;
+			stream_name = stream_name_;
+		}
 
-    void Append(const std::shared_ptr<MonitoringCollectionData> &collection)
-    {
-        edge_connection += collection->edge_connection;
-        edge_bitrate += collection->edge_bitrate;
-        p2p_connection += collection->p2p_connection;
-        p2p_bitrate += collection->p2p_bitrate;
-    }
+		void Append(const std::shared_ptr<pub::MonitoringCollectionData> &collection)
+		{
+			edge_connection += collection->edge_connection;
+			edge_bitrate += collection->edge_bitrate;
+			p2p_connection += collection->p2p_connection;
+			p2p_bitrate += collection->p2p_bitrate;
+		}
 
-    static ov::String GetTypeString(MonitroingCollectionType type)
-    {
-        ov::String result;
+		static ov::String GetTypeString(MonitroingCollectionType type)
+		{
+			ov::String result;
 
-        if(type == MonitroingCollectionType::Stream)
-            result = "stream";
-        else if(type == MonitroingCollectionType::App)
-            result = "app";
-        else if(type == MonitroingCollectionType::Origin)
-            result = "org";
-        else if(type == MonitroingCollectionType::Host)
-            result = "host";
+			if (type == MonitroingCollectionType::Stream)
+				result = "stream";
+			else if (type == MonitroingCollectionType::App)
+				result = "app";
+			else if (type == MonitroingCollectionType::Origin)
+				result = "org";
+			else if (type == MonitroingCollectionType::Host)
+				result = "host";
 
-        return result;
-    }
+			return result;
+		}
 
-    MonitroingCollectionType type = MonitroingCollectionType::Stream;
-    ov::String type_string;
-    ov::String origin_name;
-    ov::String app_name;
-    ov::String stream_name;
-    uint32_t edge_connection = 0;   // count
-    uint64_t edge_bitrate = 0;      // bps
-    uint32_t p2p_connection = 0;    // count
-    uint64_t p2p_bitrate = 0;       // bps
-    std::chrono::system_clock::time_point check_time ; // (chrono)
-};
+		MonitroingCollectionType type = MonitroingCollectionType::Stream;
+		ov::String type_string;
+		ov::String origin_name;
+		ov::String app_name;
+		ov::String stream_name;
+		uint32_t edge_connection = 0;					   // count
+		uint64_t edge_bitrate = 0;						   // bps
+		uint32_t p2p_connection = 0;					   // count
+		uint64_t p2p_bitrate = 0;						   // bps
+		std::chrono::system_clock::time_point check_time;  // (chrono)
+	};
 
-// WebRTC, HLS, MPEG-DASH 등 모든 Publisher는 다음 Interface를 구현하여 MediaRouterInterface에 자신을 등록한다.
-class Publisher
-{
-public:
-	virtual bool Start();
-	virtual bool Stop();
+	// All publishers such as WebRTC, HLS and MPEG-DASH has to inherit the Publisher class and implement that interfaces
+	class Publisher : public ocst::PublisherModuleInterface
+	{
+	public:
+		virtual bool Start();
+		virtual bool Stop();
 
-	// app_name으로 Application을 찾아서 반환한다.
-	std::shared_ptr<Application> GetApplicationByName(ov::String app_name);
-	std::shared_ptr<Stream> GetStream(ov::String app_name, ov::String stream_name);
+		std::shared_ptr<Application> GetApplicationByName(const info::VHostAppName &vhost_app_name);
 
-	std::shared_ptr<Application> GetApplicationById(info::application_id_t application_id);
-	std::shared_ptr<Stream> GetStream(info::application_id_t application_id, uint32_t stream_id);
+		// First GetStream(vhost_app_name, stream_name) and if it fails pull stream by the orchetrator
+		// If an url is set, the url is higher priority than OriginMap
+		std::shared_ptr<Stream> PullStream(const std::shared_ptr<const ov::Url> &request_from, const info::VHostAppName &vhost_app_name, const ov::String &host_name, const ov::String &stream_name);
+		std::shared_ptr<Stream> GetStream(const info::VHostAppName &vhost_app_name, const ov::String &stream_name);
+		template <typename T>
+		std::shared_ptr<T> GetStreamAs(const info::VHostAppName &vhost_app_name, const ov::String &stream_name)
+		{
+			return std::static_pointer_cast<T>(GetStream(vhost_app_name, stream_name));
+		}
 
-	// monitoring data pure virtual function
-	// - collected_datas vector must be insert processed
-	virtual bool GetMonitoringCollectionData(std::vector<std::shared_ptr<MonitoringCollectionData>> &collections) = 0;
+		uint32_t GetApplicationCount();
+		std::shared_ptr<Application> GetApplicationById(info::application_id_t application_id);
+		std::shared_ptr<Stream> GetStream(info::application_id_t application_id, uint32_t stream_id);
+		template <typename T>
+		std::shared_ptr<T> GetStreamAs(info::application_id_t application_id, uint32_t stream_id)
+		{
+			return std::static_pointer_cast<T>(GetStream(application_id, stream_id));
+		}
 
-protected:
-	explicit Publisher(const info::Application *application_info, std::shared_ptr<MediaRouteInterface> router);
-	virtual ~Publisher() = default;
+		//--------------------------------------------------------------------
+		// Implementation of ModuleInterface
+		//--------------------------------------------------------------------
+		bool OnCreateApplication(const info::Application &app_info) override;
+		bool OnDeleteApplication(const info::Application &app_info) override;
 
-	// 모든 Publisher는 Type을 정의해야 하며, Config과 일치해야 한다.
-	virtual cfg::PublisherType GetPublisherType() = 0;
-	virtual std::shared_ptr<Application> OnCreateApplication(const info::Application *application_info) = 0;
+		// Each Publisher should define their type
+		virtual PublisherType GetPublisherType() const = 0;
+		virtual const char *GetPublisherName() const = 0;
 
-	// 모든 application들의 map
-	std::map<info::application_id_t, std::shared_ptr<Application>> _applications;
+	protected:
+		explicit Publisher(const cfg::Server &server_config, const std::shared_ptr<MediaRouteInterface> &router);
+		virtual ~Publisher();
 
-	// Publisher를 상속받은 클래스에서 사용되는 정보
-	std::shared_ptr<MediaRouteApplicationInterface> _application;
-	const info::Application *_application_info;
+		const cfg::Server &GetServerConfig() const;
 
-	std::shared_ptr<MediaRouteInterface> _router;
-};
+		virtual std::shared_ptr<Application> OnCreatePublisherApplication(const info::Application &application_info) = 0;
+		virtual bool OnDeletePublisherApplication(const std::shared_ptr<pub::Application> &application) = 0;
 
+		// SignedPolicy is an official feature
+		CheckSignatureResult HandleSignedPolicy(const std::shared_ptr<const ov::Url> &request_url, const std::shared_ptr<ov::SocketAddress> &client_address, std::shared_ptr<const SignedPolicy> &signed_policy);
+		// SingedToken is used only special purposes
+		CheckSignatureResult HandleSignedToken(const std::shared_ptr<const ov::Url> &request_url, const std::shared_ptr<ov::SocketAddress> &client_address, std::shared_ptr<const SignedToken> &signed_token);
+
+		std::map<info::application_id_t, std::shared_ptr<Application>> 	_applications;
+		std::shared_mutex 		_application_map_mutex;
+
+		const cfg::Server _server_config;
+		std::shared_ptr<MediaRouteInterface> _router;
+	};
+}  // namespace pub

@@ -13,10 +13,16 @@
 class OvenCodecImplAvcodecDecAVC : public TranscodeDecoder
 {
 public:
-    AVCodecID GetCodecID() const noexcept override
-    {
-        return AV_CODEC_ID_H264;
-    }
+	OvenCodecImplAvcodecDecAVC(const info::Stream &stream_info)
+		: TranscodeDecoder(stream_info)
+	{
+	}
 
-    std::unique_ptr<MediaFrame> RecvBuffer(TranscodeResult *result) override;
+	AVCodecID GetCodecID() const noexcept override
+	{
+		return AV_CODEC_ID_H264;
+	}
+	void ThreadDecode() override;
+
+	std::shared_ptr<MediaFrame> RecvBuffer(TranscodeResult *result) override;
 };

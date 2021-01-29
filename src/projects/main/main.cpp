@@ -1,291 +1,312 @@
+//==============================================================================
+//
+//  OvenMediaEngine
+//
+//  Created by Hyunjun Jang
+//  Copyright (c) 2018 AirenSoft. All rights reserved.
+//
+//==============================================================================
 #include "main.h"
 
-#include <iostream>
-#include <regex>
-
-#include <sys/utsname.h>
-
-#include <srtp2/srtp.h>
-#include <srt/srt.h>
-
-#include <config/config_manager.h>
-#include <webrtc/webrtc_publisher.h>
-#include <dash/dash_publisher.h>
-#include <hls/hls_publisher.h>
-#include <media_router/media_router.h>
-#include <transcode/transcoder.h>
-#include <monitoring/monitoring_server.h>
-#include <web_console/web_console.h>
-#include <rtmp/rtmp_provider.h>
-#include <base/ovcrypto/ovcrypto.h>
-#include <base/ovlibrary/stack_trace.h>
+#include <api_server/api_server.h>
+#include <base/ovlibrary/daemon.h>
 #include <base/ovlibrary/log_write.h>
+#include <config/config_manager.h>
+#include <mediarouter/mediarouter.h>
+#include <monitoring/monitoring.h>
+#include <orchestrator/orchestrator.h>
+#include <providers/providers.h>
+#include <publishers/publishers.h>
+#include <transcode/transcoder.h>
+#include <web_console/web_console.h>
 
-void SrtLogHandler(void *opaque, int level, const char *file, int line, const char *area, const char *message);
+#include "banner.h"
+#include "init_utilities.h"
+#include "main_private.h"
+#include "signals.h"
+#include "third_parties.h"
+#include "utilities.h"
 
-struct ParseOption
-{
-	// -c <config_path>
-	ov::String config_path = "";
+extern bool g_is_terminated;
 
-	// -s start with systemctl
-    bool start_service = false;
-};
-
-bool TryParseOption(int argc, char *argv[], ParseOption *parse_option)
-{
-	constexpr const char *opt_string = "hvt:c:s";
-
-	while(true)
-	{
-		int name = getopt(argc, argv, opt_string);
-
-		switch(name)
-		{
-			case -1:
-				// end of arguments
-				return true;
-
-			case 'h':
-				printf("Usage: %s [OPTION]...\n", argv[0]);
-				printf("    -c <path>             Specify a path of config files\n");
-				return false;
-
-			case 'v':
-				printf("OvenMediaEngine v%s\n", OME_VERSION);
-				return false;
-
-			case 'c':
-				parse_option->config_path = optarg;
-				break;
-
-			case 's':
-			    // Don't use this option manually
-				parse_option->start_service = true;
-				break;
-
-			default: // '?'
-				// invalid argument
-				return false;
-		}
-	}
-}
+static ov::Daemon::State Initialize(int argc, char *argv[], ParseOption *parse_option);
+static bool Uninitialize();
 
 int main(int argc, char *argv[])
 {
 	ParseOption parse_option;
 
-	if(TryParseOption(argc, argv, &parse_option) == false)
 	{
-		return 1;
-	}
-
-	ov::StackTrace::InitializeStackTrace(OME_VERSION);
-
-    ov::LogWrite::Initialize(parse_option.start_service);
-
-	if(cfg::ConfigManager::Instance()->LoadConfigs(parse_option.config_path) == false)
-	{
-		logte("An error occurred while load config");
-		return 1;
-	}
-
-	struct utsname uts {};
-	::uname(&uts);
-
-	logti("OvenMediaEngine v%s is started on [%s] (%s %s - %s, %s)", OME_VERSION, uts.nodename, uts.sysname, uts.machine, uts.release, uts.version);
-
-	logtd("Trying to initialize SRT...");
-	srt_startup();
-	srt_setloglevel(logging::LogLevel::debug);
-	srt_setloghandler(nullptr, SrtLogHandler);
-
-	logtd("Trying to initialize OpenSSL...");
-	ov::OpensslManager::InitializeOpenssl();
-
-	logtd("Trying to initialize libsrtp...");
-	int err = srtp_init();
-	if(err != srtp_err_status_ok)
-	{
-		loge("SRTP", "Could not initialize SRTP (err: %d)", err);
-		return 1;
-	}
-
-	std::shared_ptr<cfg::Server> server = cfg::ConfigManager::Instance()->GetServer();
-	std::vector<cfg::Host> hosts = server->GetHosts();
-
-	std::shared_ptr<MediaRouter> router;
-	std::shared_ptr<Transcoder> transcoder;
-	std::vector<std::shared_ptr<WebConsoleServer>> web_console_servers;
-
-	std::vector<std::shared_ptr<pvd::Provider>> providers;
-	std::vector<std::shared_ptr<Publisher>> publishers;
-	//std::shared_ptr<MonitoringServer> monitoring_server;
-
-	std::map<ov::String, std::vector<info::Application>> application_infos;
-
-	for(auto &host : hosts)
-	{
-		auto host_name = host.GetName();
-
-		logtd("Trying to create modules for host [%s]", host_name.CStr());
-
-		auto &app_info_list = application_infos[host.GetName()];
-
-		for(const auto &application : host.GetApplications())
+		auto state = Initialize(argc, argv, &parse_option);
+		switch (state)
 		{
-			logti("Trying to create application [%s] (%s)...", application.GetName().CStr(), application.GetTypeName().CStr());
+			case ov::Daemon::State::PARENT_SUCCESS:
+				return 0;
 
-			app_info_list.emplace_back(application);
+			case ov::Daemon::State::CHILD_SUCCESS:
+				// continue;
+				break;
+
+			case ov::Daemon::State::PIPE_FAIL:
+				[[fallthrough]];
+			case ov::Daemon::State::FORK_FAIL:
+				[[fallthrough]];
+			case ov::Daemon::State::PARENT_FAIL:
+				[[fallthrough]];
+			case ov::Daemon::State::CHILD_FAIL:
+				// Failed to launch
+				return 1;
 		}
+	}
 
-		if(app_info_list.empty() == false)
+	PrintBanner();
+
+	auto server_config = cfg::ConfigManager::GetInstance()->GetServer();
+
+	auto orchestrator = ocst::Orchestrator::GetInstance();
+	auto monitor = mon::Monitoring::GetInstance();
+
+	// Create info::Host list
+	std::vector<info::Host> host_info_list;
+	{
+		// Used to check duplicate names
+		std::map<ov::String, bool> vhost_map;
+		auto &hosts = server_config->GetVirtualHostList();
+
+		for (const auto &host : hosts)
 		{
-			logti("Trying to create MediaRouter for host [%s]...", host_name.CStr());
-			router = MediaRouter::Create(app_info_list);
+			auto item = vhost_map.find(host.GetName());
 
-			logti("Trying to create Transcoder for host [%s]...", host_name.CStr());
-			transcoder = Transcoder::Create(app_info_list, router);
-
-			for(const auto &application_info : app_info_list)
+			if (item == vhost_map.end())
 			{
-				auto app_name = application_info.GetName();
-
-				if(application_info.GetType() == cfg::ApplicationType::Live)
-				{
-					logti("Trying to create RTMP Provider for application [%s/%s]...", host_name.CStr(), app_name.CStr());
-					providers.push_back(RtmpProvider::Create(&application_info, router));
-				}
-
-				if(application_info.GetWebConsole().IsParsed())
-				{
-					logti("Trying to initialize WebConsole for application [%s/%s]...", host_name.CStr(), app_name.CStr());
-					web_console_servers.push_back(WebConsoleServer::Create(&application_info));
-				}
-
-				auto publisher_list = application_info.GetPublishers().GetPublisherList();
-				std::map<int, std::shared_ptr<HttpServer>> segment_http_server_manager; // key : port number
-
-				for(const auto &publisher : publisher_list)
-				{
-					if(publisher->IsParsed())
-					{
-						auto application = router->GetRouteApplicationById(application_info.GetId());
-
-						switch(publisher->GetType())
-						{
-							case cfg::PublisherType::Webrtc:
-								logti("Trying to create WebRTC Publisher for application [%s/%s]...", host_name.CStr(), app_name.CStr());
-								publishers.push_back(WebRtcPublisher::Create(&application_info, router, application));
-								break;
-
-							case cfg::PublisherType::Dash:
-								logti("Trying to create DASH Publisher for application [%s/%s]...", host_name.CStr(), app_name.CStr());
-								publishers.push_back(DashPublisher::Create(segment_http_server_manager,
-								                                           &application_info,
-								                                           router));
-								break;
-
-							case cfg::PublisherType::Hls:
-								logti("Trying to create HLS Publisher for application [%s/%s]...", host_name.CStr(), app_name.CStr());
-								publishers.push_back(HlsPublisher::Create(segment_http_server_manager,
-								                                          &application_info,
-								                                          router));
-								break;
-
-							case cfg::PublisherType::Rtmp:
-							default:
-								// not implemented
-								break;
-						}
-					}
-				}
+				host_info_list.emplace_back(host);
+				vhost_map[host.GetName()] = true;
+			}
+			else
+			{
+				logte("Duplicated VirtualHost found: %s", host.GetName().CStr());
+				return 1;
 			}
 		}
-		else
+	}
+
+	orchestrator->ApplyOriginMap(host_info_list);
+
+	auto api_server = api::Server::GetInstance();
+
+	api_server->Start(server_config);
+
+	INIT_EXTERNAL_MODULE("FFmpeg", InitializeFFmpeg);
+	INIT_EXTERNAL_MODULE("SRT", InitializeSrt);
+	INIT_EXTERNAL_MODULE("OpenSSL", InitializeOpenSsl);
+	INIT_EXTERNAL_MODULE("SRTP", InitializeSrtp);
+
+	//--------------------------------------------------------------------
+	// Create the modules
+	//--------------------------------------------------------------------
+	//
+	// NOTE: THE ORDER OF MODULES IS IMPORTANT
+	//
+	//
+	// Initialize MediaRouter (MediaRouter must be registered first)
+	INIT_MODULE(media_router, "MediaRouter", MediaRouter::Create());
+
+	// Initialize Publishers
+	INIT_MODULE(webrtc_publisher, "WebRTC Publisher", WebRtcPublisher::Create(*server_config, media_router));
+	INIT_MODULE(hls_publisher, "HLS Publisher", HlsPublisher::Create(*server_config, media_router));
+	INIT_MODULE(dash_publisher, "MPEG-DASH Publisher", DashPublisher::Create(*server_config, media_router));
+	INIT_MODULE(lldash_publisher, "Low-Latency MPEG-DASH Publisher", CmafPublisher::Create(*server_config, media_router));
+	INIT_MODULE(ovt_publisher, "OVT Publisher", OvtPublisher::Create(*server_config, media_router));
+	INIT_MODULE(file_publisher, "File Publisher", FilePublisher::Create(*server_config, media_router));
+	INIT_MODULE(rtmppush_publisher, "RtmpPush Publisher", RtmpPushPublisher::Create(*server_config, media_router));
+	INIT_MODULE(thumbnail_publisher, "Thumbnail Publisher", ThumbnailPublisher::Create(*server_config, media_router));
+
+	// Initialize Transcoder
+	INIT_MODULE(transcoder, "Transcoder", Transcoder::Create(media_router));
+
+	// Initialize Providers
+	INIT_MODULE(mpegts_provider, "MPEG-TS Provider", pvd::MpegTsProvider::Create(*server_config, media_router));
+	INIT_MODULE(rtmp_provider, "RTMP Provider", pvd::RtmpProvider::Create(*server_config, media_router));
+	INIT_MODULE(ovt_provider, "OVT Provider", pvd::OvtProvider::Create(*server_config, media_router));
+	INIT_MODULE(rtspc_provider, "RTSPC Provider", pvd::RtspcProvider::Create(*server_config, media_router));
+	// PENDING : INIT_MODULE(rtsp_provider, "RTSP Provider", pvd::RtspProvider::Create(*server_config, media_router));
+
+	logti("All modules are initialized successfully");
+
+	bool should_exit = false;
+
+	for (auto &host_info : host_info_list)
+	{
+		auto host_name = host_info.GetName();
+
+		logtd("Trying to create host [%s]", host_name.CStr());
+		monitor->OnHostCreated(host_info);
+
+		// Create applications that defined by the configuration
+		for (auto &app_cfg : host_info.GetApplicationList())
 		{
-			logtw("Nothing to do for host [%s]", host_name.CStr());
+			auto result = orchestrator->CreateApplication(host_info, app_cfg);
+
+			switch (result)
+			{
+				case ocst::Result::Failed:
+					logtc("Failed to create an application: %s", app_cfg.GetName().CStr());
+					should_exit = true;
+					break;
+
+				case ocst::Result::Succeeded:
+					break;
+
+				case ocst::Result::Exists:
+					logtc("Duplicate application [%s] found. Please check the settings.", app_cfg.GetName().CStr());
+					should_exit = true;
+					break;
+
+				case ocst::Result::NotExists:
+					// This should never happen
+					OV_ASSERT2(false);
+					logtc("Internal error occurred (THIS IS A BUG)");
+					should_exit = true;
+					break;
+			}
+
+			if (should_exit)
+			{
+				break;
+			}
 		}
 
-//		// Monitoring Server
-//        auto monitoring_port = host.GetPorts().GetMonitoringPort();
-//        if(monitoring_port.IsParsed() && (providers.size() > 0 || publishers.size() > 0))
-//        {
-//            logtd("Monitoring Server Start - host[%s] port[%d]", host_name.CStr(), monitoring_port.GetPort());
-//
-//            monitoring_server = std::make_shared<MonitoringServer>();
-//            monitoring_server->Start(ov::SocketAddress(static_cast<uint16_t>(monitoring_port.GetPort())),
-//                                     providers,
-//                                     publishers);
-//        }
+		if (should_exit)
+		{
+			break;
+		}
 	}
 
-	while(true)
+	if (should_exit == false)
 	{
-		sleep(1);
+		if (parse_option.start_service)
+		{
+			ov::Daemon::SetEvent();
+		}
+
+		while (g_is_terminated == false)
+		{
+			sleep(1);
+		}
 	}
 
-	logtd("Trying to uninitialize OpenSSL...");
-	ov::OpensslManager::ReleaseOpenSSL();
+	orchestrator->Release();
+	// Relase all modules
+	monitor->Release();
+	api_server->Stop();
 
-	srt_cleanup();
+	RELEASE_MODULE(mpegts_provider, "MPEG-TS Provider");
+	RELEASE_MODULE(rtmp_provider, "RTMP Provider");
+	RELEASE_MODULE(ovt_provider, "OVT Provider");
+	RELEASE_MODULE(rtspc_provider, "RTSPC Provider");
+	// PENDING : RELEASE_MODULE(rtsp_provider, "RTSP Provider");
 
-	logti("OvenMediaEngine will be terminated");
+	RELEASE_MODULE(transcoder, "Transcoder");
+
+	RELEASE_MODULE(webrtc_publisher, "WebRTC Publisher");
+	RELEASE_MODULE(hls_publisher, "HLS Publisher");
+	RELEASE_MODULE(dash_publisher, "MPEG-DASH Publisher");
+	RELEASE_MODULE(lldash_publisher, "Low-Latency MPEG-DASH Publisher");
+	RELEASE_MODULE(ovt_publisher, "OVT Publisher");
+	RELEASE_MODULE(file_publisher, "File Publisher");
+	RELEASE_MODULE(rtmppush_publisher, "RtmpPush Publisher");
+	RELEASE_MODULE(thumbnail_publisher, "Thumbnail Publisher");
+
+	RELEASE_MODULE(media_router, "MediaRouter");
+
+	TERMINATE_EXTERNAL_MODULE("SRTP", TerminateSrtp);
+	TERMINATE_EXTERNAL_MODULE("OpenSSL", TerminateOpenSsl);
+	TERMINATE_EXTERNAL_MODULE("SRT", TerminateSrt);
+	TERMINATE_EXTERNAL_MODULE("FFmpeg", TerminateFFmpeg);
+
+	Uninitialize();
 
 	return 0;
 }
 
-void SrtLogHandler(void *opaque, int level, const char *file, int line, const char *area, const char *message)
+static ov::Daemon::State Initialize(int argc, char *argv[], ParseOption *parse_option)
 {
-	// SRT log format:
-	// HH:mm:ss.ssssss/SRT:xxxx:xxxxxx.N: xxx.c: .................
-	// 13:20:15.618019.N: SRT.c: PASSING request from: 192.168.0.212:63308 to agent:397692317
-	// 13:20:15.618019.!!FATAL!!: SRT.c: PASSING request from: 192.168.0.212:63308 to agent:397692317
-	// 13:20:15.618019.!W: SRT.c: PASSING request from: 192.168.0.212:63308 to agent:397692317
-	// 13:20:15.618019.*E: SRT.c: PASSING request from: 192.168.0.212:63308 to agent:397692317
-	// 20:41:11.929158/ome_origin*E: SRT.d: SND-DROPPED 1 packets - lost delaying for 1021m
-	// 13:20:15.618019/SRT:RcvQ:worker.N: SRT.c: PASSING request from: 192.168.0.212:63308 to agent:397692317
-
-	std::smatch matches;
-	std::string m = message;
-	ov::String mess;
-
-	if(std::regex_search(m, matches, std::regex("^([0-9]{2}:[0-9]{2}:[0-9]{2}.[0-9]{6})([/a-zA-Z:.!*_]+) ([/a-zA-Z:.!]+ )?(.+)")))
+	if (TryParseOption(argc, argv, parse_option) == false)
 	{
-		mess = std::string(matches[4]).c_str();
-	}
-	else
-	{
-		// Unknown pattern
-		mess = message;
+		return ov::Daemon::State::PARENT_FAIL;
 	}
 
-	const char *SRT_LOG_TAG = "SRT";
-
-	switch(level)
+	if (parse_option->help)
 	{
-		case logging::LogLevel::debug:
-			ov_log_internal(OVLogLevelDebug, SRT_LOG_TAG, file, line, area, "%s", mess.CStr());
-			break;
-
-		case logging::LogLevel::note:
-			ov_log_internal(OVLogLevelInformation, SRT_LOG_TAG, file, line, area, "%s", mess.CStr());
-			break;
-
-		case logging::LogLevel::warning:
-			ov_log_internal(OVLogLevelWarning, SRT_LOG_TAG, file, line, area, "%s", mess.CStr());
-			break;
-
-		case logging::LogLevel::error:
-			ov_log_internal(OVLogLevelError, SRT_LOG_TAG, file, line, area, "%s", mess.CStr());
-			break;
-
-		case logging::LogLevel::fatal:
-			ov_log_internal(OVLogLevelCritical, SRT_LOG_TAG, file, line, area, "%s", mess.CStr());
-			break;
-
-		default:
-			ov_log_internal(OVLogLevelError, SRT_LOG_TAG, file, line, area, "(Unknown level: %d) %s", level, mess.CStr());
-			break;
+		::printf("Usage: %s [OPTION]...\n", argv[0]);
+		::printf("\n");
+		::printf("    -c <path>   Specify a path of config files\n");
+		::printf("    -v          Print OME Version\n");
+		::printf("    -i          Ignores and executes the settings of %s\n", CFG_LAST_CONFIG_FILE_NAME);
+		::printf("                (The JSON file is automatically generated when RESTful API is called)\n");
+		return ov::Daemon::State::PARENT_FAIL;
 	}
+
+	if (parse_option->version)
+	{
+		::printf("OvenMediaEngine v%s\n", OME_VERSION);
+		return ov::Daemon::State::PARENT_FAIL;
+	}
+
+	// Daemonize OME with start_service argument
+	if (parse_option->start_service)
+	{
+		auto state = ov::Daemon::Initialize();
+
+		switch (state)
+		{
+			case ov::Daemon::State::PARENT_SUCCESS:
+				// Forked
+				return state;
+
+			case ov::Daemon::State::CHILD_SUCCESS:
+				break;
+
+			case ov::Daemon::State::PIPE_FAIL:
+				[[fallthrough]];
+			case ov::Daemon::State::FORK_FAIL:
+				[[fallthrough]];
+			case ov::Daemon::State::PARENT_FAIL:
+				[[fallthrough]];
+			case ov::Daemon::State::CHILD_FAIL:
+				// Failed to launch
+				logte("An error occurred while creating daemon");
+				return state;
+		}
+	}
+
+	if (InitializeSignals() == false)
+	{
+		logte("Could not initialize signals");
+		return ov::Daemon::State::CHILD_FAIL;
+	}
+
+	ov::LogWrite::Initialize(parse_option->start_service);
+
+	try
+	{
+		cfg::ConfigManager::GetInstance()->LoadConfigs(
+			parse_option->config_path,
+			parse_option->ignore_last_config);
+
+		return ov::Daemon::State::CHILD_SUCCESS;
+	}
+	catch (std::shared_ptr<cfg::ConfigError> &error)
+	{
+		logte("An error occurred while load config: %s", error->ToString().CStr());
+	}
+
+	return ov::Daemon::State::CHILD_FAIL;
+}
+
+static bool Uninitialize()
+{
+	logti("OvenMediaEngine will be terminated");
+
+	return true;
 }

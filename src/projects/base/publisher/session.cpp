@@ -1,61 +1,68 @@
-#include "publisher_private.h"
 #include "session.h"
 #include "application.h"
+#include "base/info/stream.h"
+#include "publisher_private.h"
 
-Session::Session(std::shared_ptr<Application> application, std::shared_ptr<Stream> stream)
-	: SessionInfo()
+namespace pub
 {
-	_application = application;
-	_stream = stream;
-	_state = SessionState::Ready;
-}
+	Session::Session(const std::shared_ptr<Application> &application, const std::shared_ptr<Stream> &stream)
+		: info::Session(*std::static_pointer_cast<info::Stream>(stream))
+	{
+		_application = application;
+		_stream = stream;
+		_state = SessionState::Ready;
+	}
 
-Session::Session(const SessionInfo &info, std::shared_ptr<Application> application, std::shared_ptr<Stream> stream)
-	: SessionInfo(info)
-{
-	_application = application;
-	_stream = stream;
-	_state = SessionState::Ready;
-}
+	Session::Session(const info::Session &info, const std::shared_ptr<Application> &application, const std::shared_ptr<Stream> &stream)
+		: info::Session(*std::static_pointer_cast<info::Stream>(stream), info)
+	{
+		_application = application;
+		_stream = stream;
+		_state = SessionState::Ready;
+	}
 
-Session::~Session()
-{
-}
+	Session::~Session()
+	{
+	}
 
-std::shared_ptr<Application> Session::GetApplication()
-{
-	return _application;
-}
+	const std::shared_ptr<Application> &Session::GetApplication()
+	{
+		return _application;
+	}
 
-std::shared_ptr<Stream> Session::GetStream()
-{
-	return _stream;
-}
+	const std::shared_ptr<Stream> &Session::GetStream()
+	{
+		return _stream;
+	}
 
-bool Session::Start()
-{
-	_state = SessionState::Started;
-	return true;
-}
+	bool Session::Start()
+	{
+		_state = SessionState::Started;
+		return true;
+	}
 
-bool Session::Stop()
-{
-	// Virtual Function으로 자식 class는 이미 모든 정리를 마무리 했다.
-	// 상태를 변경한다.
-	_state = SessionState::Stopped;
+	bool Session::Stop()
+	{
+		_state = SessionState::Stopped;
 
-	return true;
-}
+		return true;
+	}
 
-Session::SessionState Session::GetState()
-{
-	return _state;
-}
+	Session::SessionState Session::GetState()
+	{
+		return _state;
+	}
 
-void Session::Terminate(ov::String reason)
-{
-	_state = SessionState::Error;
-	_error_reason = reason;
+	void Session::SetState(SessionState state)
+	{
+		_state = state;
+	}
 
-	GetStream()->RemoveSession(GetId());
-}
+	void Session::Terminate(ov::String reason)
+	{
+		_state = SessionState::Error;
+		_error_reason = reason;
+
+		GetStream()->RemoveSession(GetId());
+	}
+}  // namespace pub

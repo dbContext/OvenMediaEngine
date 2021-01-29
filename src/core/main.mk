@@ -18,8 +18,8 @@ LINK_SERVICE_DIRECTORY := /etc/systemd/system
 include $(BUILD_SYSTEM_DIRECTORY)/pre_processing.mk
 include $(BUILD_SYSTEM_DIRECTORY)/os_version.mk
 include $(BUILD_SYSTEM_DIRECTORY)/colors.mk
-include $(BUILD_SYSTEM_DIRECTORY)/global_config.mk
 include $(BUILD_SYSTEM_DIRECTORY)/config.mk
+include $(BUILD_SYSTEM_DIRECTORY)/global_config.mk
 include $(BUILD_SYSTEM_DIRECTORY)/environments.mk
 include $(BUILD_SYSTEM_DIRECTORY)/utilities.mk
 include $(BUILD_SYSTEM_DIRECTORY)/progress.mk
@@ -35,6 +35,8 @@ endif
 # Rules
 #===============================================================================
 BUILD_TARGET_LIST :=
+# File list to delete
+BUILD_FILES_TO_CLEAN :=
 
 .PHONY: all help release
 all: directories_to_prepare build_target_list
@@ -55,11 +57,11 @@ help:
 include $(BUILD_PROJECTS_DIRECTORY)/AMS.mk
 # endif
 
-include $(BUILD_SYSTEM_DIRECTORY)/informations.mk
-
 BUILD_TARGET_LIST := $(strip $(BUILD_TARGET_LIST))
 BUILD_BUILT_COUNT := 1
 BUILD_TOTAL_PROJECTS_COUNT := $(words $(BUILD_TARGET_LIST))
+
+include $(BUILD_SYSTEM_DIRECTORY)/informations.mk
 
 .PHONY: build_target_list
 build_target_list: $(BUILD_TARGET_LIST)
@@ -91,6 +93,11 @@ clean_internal:
 	@for target in $(BUILD_TARGET_LIST); \
 	do \
 		echo "    $(CONFIG_CLEAN_COLOR)Deleting target$(ANSI_RESET) $$target..."; \
+		rm -rf $$target; \
+	done
+	@for target in $(BUILD_FILES_TO_CLEAN); \
+	do \
+		echo "    $(CONFIG_CLEAN_COLOR)Deleting file$(ANSI_RESET) $$target..."; \
 		rm -rf $$target; \
 	done
 

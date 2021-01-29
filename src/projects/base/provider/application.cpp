@@ -7,17 +7,18 @@
 //
 //==============================================================================
 
+#include "provider.h"
 #include "application.h"
 #include "stream.h"
-
-#define OV_LOG_TAG "Application"
+#include "provider_private.h"
 
 namespace pvd
 {
-	Application::Application(const info::Application *application_info)
-		: info::Application(*application_info)
+	Application::Application(const std::shared_ptr<Provider> &provider, const info::Application &application_info)
+		: info::Application(application_info)
 	{
-
+		_provider = provider;
+		_last_issued_stream_id = 100;
 	}
 
 	Application::~Application()
@@ -25,33 +26,67 @@ namespace pvd
 		Stop();
 	}
 
+	const char* Application::GetApplicationTypeName()
+	{
+		if(_provider == nullptr)
+		{
+			return "";
+		}
+
+		if(_app_type_name.IsEmpty())
+		{
+			_app_type_name.Format("%s %s",  _provider->GetProviderName(), "Application");
+		}
+
+		return _app_type_name.CStr();
+	}
+
 	bool Application::Start()
 	{
-		// TODO(soulk): Check this return value
-		return false;
+		logti("%s has created [%s] application", _provider->GetProviderName(), GetName().CStr());
+
+		_state = ApplicationState::Started;
+
+		return true;
 	}
 
 	bool Application::Stop()
 	{
-		// TODO(soulk): Check this return value
-		return false;
+		if(_state == ApplicationState::Stopped)
+		{
+			return true;
+		}
+
+		DeleteAllStreams();
+		logti("%s has deleted [%s] application", _provider->GetProviderName(), GetName().CStr());
+		_state = ApplicationState::Stopped;
+		return true;
 	}
 
-	std::shared_ptr<Stream> Application::GetStreamById(uint32_t stream_id)
+	info::stream_id_t Application::IssueUniqueStreamId()
 	{
+		return _last_issued_stream_id++;
+	}
+
+	const std::shared_ptr<Stream> Application::GetStreamById(uint32_t stream_id)
+	{
+		std::shared_lock<std::shared_mutex> lock(_streams_guard);
+
 		if(_streams.find(stream_id) == _streams.end())
 		{
 			return nullptr;
 		}
 
-		return _streams[stream_id];
+		return _streams.at(stream_id);
 	}
 
-	std::shared_ptr<Stream> Application::GetStreamByName(ov::String stream_name)
+	const std::shared_ptr<Stream> Application::GetStreamByName(ov::String stream_name)
 	{
+		std::shared_lock<std::shared_mutex> lock(_streams_guard);
+		
 		for(auto const &x : _streams)
 		{
-			auto stream = x.second;
+			auto& stream = x.second;
 			if(stream->GetName() == stream_name)
 			{
 				return stream;
@@ -61,48 +96,48 @@ namespace pvd
 		return nullptr;
 	}
 
-	// 스트림을 생성한다
-	std::shared_ptr<Stream> Application::MakeStream()
+	bool Application::DeleteStream(const std::shared_ptr<Stream> &stream)
 	{
-		auto stream = OnCreateStream();
-		if(!stream)
+		std::unique_lock<std::shared_mutex> streams_lock(_streams_guard);
+
+		if(_streams.find(stream->GetId()) == _streams.end())
 		{
-			// Stream 생성 실패
-			return nullptr;
-		}
-
-		return stream;
-	}
-
-	bool Application::CreateStream2(std::shared_ptr<Stream> stream)
-	{
-		logtd("CreateStream");
-
-		if(stream == nullptr)
-		{
+			logtc("Could not find stream to be removed : %s/%s(%u)", stream->GetApplicationInfo().GetName().CStr(), stream->GetName().CStr(), stream->GetId());
 			return false;
 		}
+		_streams.erase(stream->GetId());
 
-		MediaRouteApplicationConnector::CreateStream(stream);
+		streams_lock.unlock();
+		
+		stream->Stop();
 
-		_streams[stream->GetId()] = stream;
-
+		NotifyStreamDeleted(stream);
 
 		return true;
 	}
 
-	bool Application::DeleteStream2(std::shared_ptr<Stream> stream)
+	bool Application::NotifyStreamCreated(const std::shared_ptr<Stream> &stream)
 	{
-		logtd("DeleteStream");
+		return MediaRouteApplicationConnector::CreateStream(stream);
+	}
 
-		if(_streams.find(stream->GetId()) == _streams.end())
+	bool Application::NotifyStreamDeleted(const std::shared_ptr<Stream> &stream)
+	{
+		return MediaRouteApplicationConnector::DeleteStream(stream);
+	}
+
+	bool Application::DeleteAllStreams()
+	{
+		std::unique_lock<std::shared_mutex> lock(_streams_guard);
+
+		for(auto it = _streams.cbegin(); it != _streams.cend(); )
 		{
-			return false;
+			auto stream = it->second;
+			it = _streams.erase(it);
+			stream->Stop();
+
+			NotifyStreamDeleted(stream);
 		}
-
-		MediaRouteApplicationConnector::DeleteStream(stream);
-
-		_streams.erase(stream->GetId());
 
 		return true;
 	}

@@ -9,79 +9,101 @@
 //
 //==============================================================================
 
-#include <iostream>
 #include <unistd.h>
 
-#include "transcoder.h"
+#include <iostream>
+
 #include "config/config_manager.h"
+#include "transcode_private.h"
+#include "transcoder.h"
 
-#define OV_LOG_TAG "Transcoder"
-
-std::shared_ptr<Transcoder> Transcoder::Create(const std::vector<info::Application> &application_list, std::shared_ptr<MediaRouteInterface> router)
+std::shared_ptr<Transcoder> Transcoder::Create(std::shared_ptr<MediaRouteInterface> router)
 {
-	auto transcoder = std::make_shared<Transcoder>(application_list, router);
-
-	transcoder->Start();
-
+	auto transcoder = std::make_shared<Transcoder>(router);
+	if (!transcoder->Start())
+	{
+		logte("An error occurred while creating Transcoder");
+		return nullptr;
+	}
 	return transcoder;
 }
 
-Transcoder::Transcoder(const std::vector<info::Application> &application_list, std::shared_ptr<MediaRouteInterface> router)
+Transcoder::Transcoder(std::shared_ptr<MediaRouteInterface> router)
 {
-	_app_info_list = application_list;
-
 	_router = std::move(router);
 }
 
 bool Transcoder::Start()
 {
-	logtd("Started media trancode modules.");
-
-	if(CreateApplications() == false)
-	{
-		logte("Failed to start media transcode modules. invalid application.");
-
-		return false;
-	}
-
+	logti("Transcoder has been started.");
 	return true;
 }
 
 bool Transcoder::Stop()
 {
-	logtd("Terminated media transcode modules.");
+	logti("Transcoder has been stopped.");
+	return true;
+}
 
-	if(!DeleteApplication())
+// Create Application
+bool Transcoder::OnCreateApplication(const info::Application &app_info)
+{
+	auto application_id = app_info.GetId();
+
+	auto application = TranscodeApplication::Create(app_info);
+
+	_tracode_apps[application_id] = application;
+
+	// Register to MediaRouter
+	if (_router->RegisterObserverApp(app_info, application) == false)
+	{
+		logte("Could not register the application: %p", application.get());
+
+		return false;
+	}
+
+	// Register to MediaRouter
+	if (_router->RegisterConnectorApp(app_info, application) == false)
+	{
+		logte("Could not register the application: %p", application.get());
+
+		return false;
+	}
+
+	logti("Transcoder has created [%s][%s] application", app_info.IsDynamicApp() ? "dynamic" : "config", app_info.GetName().CStr());
+
+	return true;
+}
+
+// Delete Application
+bool Transcoder::OnDeleteApplication(const info::Application &app_info)
+{
+	auto application_id = app_info.GetId();
+	auto it = _tracode_apps.find(application_id);
+	if (it == _tracode_apps.end())
 	{
 		return false;
 	}
 
-	// TODO: 패킷 처리 스레드를 만들어야함.. 어플리케이션 단위로 만들어 버릴까?
-	return true;
-}
+	auto application = it->second;
+	application->Stop();
 
-// 어플리케이션의 스트림이 생성됨
-bool Transcoder::CreateApplications()
-{
-	for(auto const &application_info : _app_info_list)
+	// Unregister to MediaRouter
+	if (_router->UnregisterObserverApp(app_info, application) == false)
 	{
-		info::application_id_t application_id = application_info.GetId();
-
-		auto trans_app = std::make_shared<TranscodeApplication>(&application_info);
-
-		// 라우터 어플리케이션 관리 항목에 추가
-		_tracode_apps[application_id] = trans_app;
-
-		_router->RegisterObserverApp(&application_info, trans_app);
-		_router->RegisterConnectorApp(&application_info, trans_app);
+		logte("Could not unregister the application: %p", application.get());
 	}
 
-	return true;
-}
+	// Unregister to MediaRouter
+	if (_router->UnregisterConnectorApp(app_info, application) == false)
+	{
+		logte("Could not unregister the application: %p", application.get());
+	}
 
-// 어플리케이션의 스트림이 삭제됨
-bool Transcoder::DeleteApplication()
-{
+	_tracode_apps.erase(it);
+
+	logti("Transcoder has deleted [%s][%s] application", app_info.IsDynamicApp() ? "dynamic" : "config", app_info.GetName().CStr());
+
 	return true;
 }
 
@@ -90,7 +112,7 @@ std::shared_ptr<TranscodeApplication> Transcoder::GetApplicationById(info::appli
 {
 	auto obj = _tracode_apps.find(application_id);
 
-	if(obj == _tracode_apps.end())
+	if (obj == _tracode_apps.end())
 	{
 		return nullptr;
 	}

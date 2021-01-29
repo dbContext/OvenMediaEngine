@@ -1,316 +1,374 @@
-#include "publisher_private.h"
+#include "publisher.h"
 #include "application.h"
-
+#include "publisher_private.h"
 #include <algorithm>
 
-Application::Application(const info::Application *application_info)
-	: info::Application(*application_info)
+namespace pub
 {
-	_stop_thread_flag = false;
-}
-
-Application::~Application()
-{
-	Stop();
-}
-
-bool Application::Start()
-{
-	// Thread 생성
-	_stop_thread_flag = false;
-	_worker_thread = std::thread(&Application::WorkerThread, this);
-
-	return true;
-}
-
-bool Application::Stop()
-{
-	_stop_thread_flag = true;
-	_worker_thread.join();
-
-	return true;
-}
-
-// Call by MediaRouteApplicationObserver
-// Stream이 생성되었을 때 호출된다.
-bool Application::OnCreateStream(std::shared_ptr<StreamInfo> info)
-{
-	// Stream을 자식을 통해 생성해서 연결한다.
-	auto worker_count = GetThreadCount();
-	auto stream = CreateStream(info, worker_count);
-
-	if(!stream)
+	ApplicationWorker::ApplicationWorker(uint32_t worker_id, ov::String worker_name)
+		: _stream_data_queue(nullptr, 500),
+		_incoming_packet_queue(nullptr, 500)
 	{
-		// Stream 생성 실패
-		return false;
+		_worker_id = worker_id;
+		_worker_name = worker_name;
+		_stop_thread_flag = false;
 	}
 
-	_streams[info->GetId()] = stream;
-
-	return true;
-}
-
-bool Application::OnDeleteStream(std::shared_ptr<StreamInfo> info)
-{
-	if(_streams.count(info->GetId()) <= 0)
+	bool ApplicationWorker::Start()
 	{
-		logte("OnDeleteStream failed. Cannot find stream : %s/%u", info->GetName(), info->GetName());
-		return false;
+		_stop_thread_flag = false;
+		_worker_thread = std::thread(&ApplicationWorker::WorkerThread, this);
+		pthread_setname_np(_worker_thread.native_handle(), "AppWorker");
+
+		ov::String queue_name;
+
+		queue_name.Format("%s - Stream Data Queue", _worker_name.CStr());
+		_stream_data_queue.SetAlias(queue_name.CStr());
+
+		queue_name.Format("%s - Incoming Packet Queue", _worker_name.CStr());
+		_incoming_packet_queue.SetAlias(queue_name.CStr());
+
+		logti("%s ApplicationWorker has been created", _worker_name.CStr());
+
+		return true;
 	}
 
-	auto stream = std::static_pointer_cast<Stream>(GetStream(info->GetId()));
-	if(stream == nullptr)
+	bool ApplicationWorker::Stop()
 	{
-		logte("OnDeleteStream failed. Cannot find stream : %s/%u", info->GetName(), info->GetName());
-		return false;
+		if(_stop_thread_flag == true)
+		{
+			return true;
+		}
+
+		_stream_data_queue.Clear();
+		_incoming_packet_queue.Clear();
+
+		_stop_thread_flag = true;
+
+		_queue_event.Notify();
+
+		if (_worker_thread.joinable())
+		{
+			_worker_thread.join();
+		}
+
+		return true;
 	}
 
-	// Stream이 삭제되었음을 자식에게 알려서 처리하게 함
-	if(DeleteStream(info) == false)
+	bool ApplicationWorker::PushMediaPacket(const std::shared_ptr<Stream> &stream, const std::shared_ptr<MediaPacket> &media_packet)
 	{
-		return false;
+		auto data = std::make_shared<ApplicationWorker::StreamData>(stream, media_packet);
+		_stream_data_queue.Enqueue(std::move(data));
+
+		_queue_event.Notify();
+
+		return true;
 	}
 
-	stream->Stop();
-
-	_streams.erase(info->GetId());
-
-	return true;
-}
-
-bool Application::OnSendVideoFrame(std::shared_ptr<StreamInfo> stream_info,
-                                   std::shared_ptr<MediaTrack> track,
-                                   std::unique_ptr<EncodedFrame> encoded_frame,
-                                   std::unique_ptr<CodecSpecificInfo> codec_info,
-                                   std::unique_ptr<FragmentationHeader> fragmentation)
-{
-	auto data = std::make_unique<Application::VideoStreamData>(stream_info,
-	                                                           track,
-	                                                           std::move(encoded_frame),
-	                                                           std::move(codec_info),
-	                                                           std::move(fragmentation));
-
-	// Mutex (This function may be called by Router thread)
-	std::unique_lock<std::mutex> lock(_video_stream_queue_guard);
-	_video_stream_queue.push(std::move(data));
-	lock.unlock();
-	_queue_event.Notify();
-
-	return true;
-}
-
-bool Application::OnSendAudioFrame(std::shared_ptr<StreamInfo> stream_info,
-                                   std::shared_ptr<MediaTrack> track,
-                                   std::unique_ptr<EncodedFrame> encoded_frame,
-                                   std::unique_ptr<CodecSpecificInfo> codec_info,
-                                   std::unique_ptr<FragmentationHeader> fragmentation)
-{
-	auto data = std::make_unique<Application::AudioStreamData>(stream_info,
-	                                                           track,
-	                                                           std::move(encoded_frame),
-	                                                           std::move(codec_info),
-	                                                           std::move(fragmentation));
-
-	// Mutex (This function may be called by Router thread)
-	std::unique_lock<std::mutex> lock(_audio_stream_queue_guard);
-
-	_audio_stream_queue.push(std::move(data));
-	lock.unlock();
-	_queue_event.Notify();
-
-	return true;
-}
-
-bool Application::PushIncomingPacket(std::shared_ptr<SessionInfo> session_info,
-                                     std::shared_ptr<const ov::Data> data)
-{
-	auto packet = std::make_unique<Application::IncomingPacket>(session_info, data);
-
-	// Mutex (This function may be called by IcePort thread)
-	std::unique_lock<std::mutex> lock(this->_incoming_packet_queue_guard);
-	_incoming_packet_queue.push(std::move(packet));
-	lock.unlock();
-
-	_queue_event.Notify();
-
-	return true;
-}
-
-std::shared_ptr<Stream> Application::GetStream(uint32_t stream_id)
-{
-	if(_streams.count(stream_id) <= 0)
+	bool ApplicationWorker::PushNetworkPacket(const std::shared_ptr<Session> &session, const std::shared_ptr<const ov::Data> &data)
 	{
+		auto packet = std::make_shared<ApplicationWorker::IncomingPacket>(session, data);
+		_incoming_packet_queue.Enqueue(std::move(packet));
+
+		_queue_event.Notify();
+
+		return true;
+	}
+
+	std::shared_ptr<ApplicationWorker::StreamData> ApplicationWorker::PopStreamData()
+	{
+		if (_stream_data_queue.IsEmpty())
+		{
+			return nullptr;
+		}
+
+		auto data = _stream_data_queue.Dequeue(0);
+		if(data.has_value())
+		{
+			return data.value();
+		}
+
 		return nullptr;
 	}
 
-	return _streams[stream_id];
-}
-
-std::shared_ptr<Stream> Application::GetStream(ov::String stream_name)
-{
-	for(auto const &x : _streams)
+	std::shared_ptr<ApplicationWorker::IncomingPacket> ApplicationWorker::PopIncomingPacket()
 	{
-		auto stream = x.second;
-		if(stream->GetName() == stream_name)
+		if (_incoming_packet_queue.IsEmpty())
 		{
-			return stream;
+			return nullptr;
 		}
-	}
 
-	return nullptr;
-}
-
-std::unique_ptr<Application::VideoStreamData> Application::PopVideoStreamData()
-{
-	std::unique_lock<std::mutex> lock(_video_stream_queue_guard);
-
-	if(_video_stream_queue.empty())
-	{
+		auto data = _incoming_packet_queue.Dequeue(0);
+		if(data.has_value())
+		{
+			return data.value();
+		}
+		
 		return nullptr;
 	}
 
-	// 데이터를 하나 꺼낸다.
-	auto data = std::move(_video_stream_queue.front());
-	_video_stream_queue.pop();
-	return data;
-}
-
-std::unique_ptr<Application::AudioStreamData> Application::PopAudioStreamData()
-{
-	std::unique_lock<std::mutex> lock(_audio_stream_queue_guard);
-
-	if(_audio_stream_queue.empty())
+	void ApplicationWorker::WorkerThread()
 	{
+		while (!_stop_thread_flag)
+		{
+			_queue_event.Wait();
+
+			// Check media data is available
+			auto stream_data = PopStreamData();
+			if ((stream_data != nullptr) && (stream_data->_stream != nullptr) && (stream_data->_media_packet != nullptr))
+			{
+				if(stream_data->_media_packet->GetMediaType() == cmn::MediaType::Video)
+				{
+					stream_data->_stream->SendVideoFrame(stream_data->_media_packet);
+				}
+				else if(stream_data->_media_packet->GetMediaType() == cmn::MediaType::Audio)
+				{
+					stream_data->_stream->SendAudioFrame(stream_data->_media_packet);
+				}
+				else
+				{
+					// Nothing can do
+				}
+			}
+
+			// Check incoming packet is available
+			std::shared_ptr<IncomingPacket> packet = PopIncomingPacket();
+			if (packet)
+			{
+				packet->_session->OnPacketReceived(packet->_session, packet->_data);
+			}
+		}
+	}
+
+	Application::Application(const std::shared_ptr<Publisher> &publisher, const info::Application &application_info)
+		: info::Application(application_info)
+	{
+		_publisher = publisher;
+	}
+
+	Application::~Application()
+	{
+		Stop();
+	}
+
+	const char* Application::GetApplicationTypeName()
+	{
+		if(_publisher == nullptr)
+		{
+			return "";
+		}
+
+		if(_app_type_name.IsEmpty())
+		{
+			_app_type_name.Format("%s %s",  _publisher->GetPublisherName(), "Application");
+		}
+
+		return _app_type_name.CStr();
+	}
+
+	bool Application::Start()
+	{
+		_application_worker_count = GetConfig().GetStreamLoadBalancingThreadCount();
+		if(_application_worker_count < MIN_APPLICATION_WORKER_COUNT)
+		{
+			_application_worker_count = MIN_APPLICATION_WORKER_COUNT;
+		}
+		if(_application_worker_count > MAX_APPLICATION_WORKER_COUNT)
+		{
+			_application_worker_count = MIN_APPLICATION_WORKER_COUNT;
+		}
+		
+		std::lock_guard<std::shared_mutex> worker_lock(_application_worker_lock);
+
+		for(uint32_t i = 0; i < _application_worker_count; i++)
+		{
+			auto worker_name = ov::String::FormatString("%s/%s/%d", GetApplicationTypeName(), GetName().CStr(), i);
+			auto app_worker = std::make_shared<ApplicationWorker>(i, worker_name.CStr());
+			if (app_worker->Start() == false)
+			{
+				logte("Cannot create ApplicationWorker (%s)", worker_name.CStr());
+				Stop();
+
+				return false;
+			}
+
+			_application_workers.push_back(app_worker);
+		}
+
+		logti("%s has created [%s] application", GetApplicationTypeName(), GetName().CStr());
+
+		return true;
+	}
+
+	bool Application::Stop()
+	{
+		std::unique_lock<std::shared_mutex> worker_lock(_application_worker_lock);
+		for(const auto &worker : _application_workers)
+		{
+			worker->Stop();
+		}
+
+		_application_workers.clear();
+		worker_lock.unlock();
+
+		// release remaining streams
+		DeleteAllStreams();
+
+		logti("%s has deleted [%s] application", GetApplicationTypeName(), GetName().CStr());
+
+		return true;
+	}
+
+	bool Application::DeleteAllStreams()
+	{
+		std::unique_lock<std::shared_mutex> lock(_stream_map_mutex);
+
+		for(const auto &x : _streams)
+		{
+			auto stream = x.second;
+			stream->Stop();
+		}
+
+		_streams.clear();
+
+		return true;
+	}
+
+	// Called by MediaRouteApplicationObserver
+	bool Application::OnStreamCreated(const std::shared_ptr<info::Stream> &info)
+	{
+		auto stream_worker_count = GetConfig().GetSessionLoadBalancingThreadCount();
+
+		auto stream = CreateStream(info, stream_worker_count);
+		if (!stream)
+		{
+			return false;
+		}
+
+		std::lock_guard<std::shared_mutex> lock(_stream_map_mutex);
+		_streams[info->GetId()] = stream;
+
+		return true;
+	}
+
+	bool Application::OnStreamDeleted(const std::shared_ptr<info::Stream> &info)
+	{
+		std::unique_lock<std::shared_mutex> lock(_stream_map_mutex);
+
+		auto stream_it = _streams.find(info->GetId());
+		if(stream_it == _streams.end())
+		{
+			// Sometimes stream rejects stream creation if the input codec is not supported. So this is a normal situation.
+			logtd("OnStreamDeleted failed. Cannot find stream : %s/%u", info->GetName().CStr(), info->GetId());
+			return true;
+		}
+
+		auto stream = stream_it->second;
+
+		lock.unlock();
+
+		if (DeleteStream(info) == false)
+		{
+			return false;
+		}
+
+		lock.lock();
+		_streams.erase(info->GetId());
+
+		// Stop stream
+		stream->Stop();
+
+		return true;
+	}
+
+	bool Application::OnStreamPrepared(const std::shared_ptr<info::Stream> &info) 
+	{
+		std::shared_lock<std::shared_mutex> lock(_stream_map_mutex);
+
+		auto stream_it = _streams.find(info->GetId());
+		if(stream_it == _streams.end())
+		{
+			// Sometimes stream rejects stream creation if the input codec is not supported. So this is a normal situation.
+			logtd("OnStreamPrepared failed. Cannot find stream : %s/%u", info->GetName().CStr(), info->GetId());
+			return true;
+		}
+
+		auto stream = stream_it->second;
+
+		lock.unlock();
+
+		// Start stream
+		stream->Start();
+
+		return true;
+	}
+
+	std::shared_ptr<ApplicationWorker> Application::GetWorkerByStreamID(info::stream_id_t stream_id)
+	{
+		if(_application_worker_count == 0)
+		{
+			return nullptr;
+		}
+
+		std::shared_lock<std::shared_mutex> worker_lock(_application_worker_lock);
+		return _application_workers[stream_id % _application_worker_count];
+	}
+
+	bool Application::OnSendFrame(const std::shared_ptr<info::Stream> &stream,
+									   const std::shared_ptr<MediaPacket> &media_packet)
+	{
+		auto application_worker = GetWorkerByStreamID(stream->GetId());
+		if(application_worker == nullptr)
+		{
+			return false;
+		}
+
+		return application_worker->PushMediaPacket(GetStream(stream->GetId()), media_packet);
+	}
+	
+
+	bool Application::PushIncomingPacket(const std::shared_ptr<info::Session> &session_info,
+										 const std::shared_ptr<const ov::Data> &data)
+	{
+		auto stream_id = session_info->GetStream().GetId();
+		auto application_worker = GetWorkerByStreamID(stream_id);
+		if(application_worker == nullptr)
+		{
+			return false;
+		}
+
+		return application_worker->PushNetworkPacket(std::static_pointer_cast<Session>(session_info), data);
+	}
+
+	uint32_t Application::GetStreamCount()
+	{
+		return _streams.size();
+	}
+
+	std::shared_ptr<Stream> Application::GetStream(uint32_t stream_id)
+	{
+		std::shared_lock<std::shared_mutex> lock(_stream_map_mutex);
+		auto it = _streams.find(stream_id);
+		if (it == _streams.end())
+		{
+			return nullptr;
+		}
+
+		return it->second;
+	}
+
+	std::shared_ptr<Stream> Application::GetStream(ov::String stream_name)
+	{
+		std::shared_lock<std::shared_mutex> lock(_stream_map_mutex);
+		for (auto const &x : _streams)
+		{
+			auto stream = x.second;
+			if (stream->GetName() == stream_name)
+			{
+				return stream;
+			}
+		}
+
 		return nullptr;
 	}
-
-	// 데이터를 하나 꺼낸다.
-	auto data = std::move(_audio_stream_queue.front());
-	_audio_stream_queue.pop();
-	return data;
-}
-
-std::unique_ptr<Application::IncomingPacket> Application::PopIncomingPacket()
-{
-	std::unique_lock<std::mutex> lock(this->_incoming_packet_queue_guard);
-
-	if(_incoming_packet_queue.empty())
-	{
-		return nullptr;
-	}
-
-	// 데이터를 하나 꺼낸다.
-	auto packet = std::move(_incoming_packet_queue.front());
-	_incoming_packet_queue.pop();
-	return packet;
-}
-
-
-/*
- * Application WorkerThread는 Publisher의 Application 마다 하나씩 존재이며, 유일한 Thread이다.
- *
- * 다음과 같은 동작을 수행한다.
- *
- * 1. Router로부터 전달받은 Video/Audio를 Stream에 전달
- * 2. Client로부터 전달받은 Packet을 Stream에 전달
- * 3. 모든 Stream과 Session이 상속받은 Module->Process()를 주기적으로 호출
- *
- */
-void Application::WorkerThread()
-{
-	while(!_stop_thread_flag)
-	{
-		// Queue에 이벤트가 들어올때까지 무한 대기 한다.
-		// TODO: 향후 App 재시작 등의 기능을 위해 WaitFor(time) 기능을 구현한다.
-		_queue_event.Wait();
-
-		// Queue에 입력된 데이터를 처리한다.
-
-		// Check video data is available
-		std::unique_ptr<Application::VideoStreamData> video_data = PopVideoStreamData();
-
-		if((video_data != nullptr) && (video_data->_stream_info != nullptr) && (video_data->_track != nullptr))
-		{
-			OV_ASSERT2(video_data->_encoded_frame != nullptr);
-
-			SendVideoFrame(video_data->_stream_info,
-			               video_data->_track,
-			               std::move(video_data->_encoded_frame),
-			               std::move(video_data->_codec_info),
-			               std::move(video_data->_framgmentation_header));
-		}
-
-		// Check audio data is available
-		std::unique_ptr<Application::AudioStreamData> audio_data = PopAudioStreamData();
-
-		if((audio_data != nullptr) && (audio_data->_stream_info != nullptr) && (audio_data->_track != nullptr))
-		{
-			OV_ASSERT2(audio_data->_encoded_frame != nullptr);
-
-			SendAudioFrame(audio_data->_stream_info,
-			               audio_data->_track,
-			               std::move(audio_data->_encoded_frame),
-			               std::move(audio_data->_codec_info),
-			               std::move(audio_data->_framgmentation_header));
-		}
-
-		// Check incoming packet is available
-		std::unique_ptr<IncomingPacket> packet = PopIncomingPacket();
-		if(packet)
-		{
-			OnPacketReceived(packet->_session_info, packet->_data);
-		}
-
-		//TODO: Queue에 입력된 Audio Sample을 처리한다.
-		//TODO: ApplicationModule을 호출한다.
-	}
-}
-
-
-void Application::SendVideoFrame(std::shared_ptr<StreamInfo> info,
-                                 std::shared_ptr<MediaTrack> track,
-                                 std::unique_ptr<EncodedFrame> encoded_frame,
-                                 std::unique_ptr<CodecSpecificInfo> codec_info,
-                                 std::unique_ptr<FragmentationHeader> fragmentation)
-{
-	// Stream에 Packet을 전송한다.
-	auto stream = GetStream(info->GetId());
-	if(!stream)
-	{
-		// stream을 찾을 수 없다.
-		return;
-	}
-
-	stream->SendVideoFrame(track,
-	                       std::move(encoded_frame),
-	                       std::move(codec_info),
-	                       std::move(fragmentation));
-}
-
-void Application::SendAudioFrame(std::shared_ptr<StreamInfo> info,
-                                 std::shared_ptr<MediaTrack> track,
-                                 std::unique_ptr<EncodedFrame> encoded_frame,
-                                 std::unique_ptr<CodecSpecificInfo> codec_info,
-                                 std::unique_ptr<FragmentationHeader> fragmentation)
-{
-	// Stream에 Packet을 전송한다.
-	auto stream = GetStream(info->GetId());
-	if(!stream)
-	{
-		// stream을 찾을 수 없다.
-		return;
-	}
-
-	stream->SendAudioFrame(track,
-	                       std::move(encoded_frame),
-	                       std::move(codec_info),
-	                       std::move(fragmentation));
-}
-
-void Application::OnPacketReceived(std::shared_ptr<SessionInfo> session_info, std::shared_ptr<const ov::Data> data)
-{
-	// Stream으로 갈 필요없이 바로 Session으로 간다.
-	// Stream은 Broad하게 전송할때만 필요하다.
-	auto session = std::static_pointer_cast<Session>(session_info);
-	session->OnPacketReceived(session_info, data);
-}
+}  // namespace pub

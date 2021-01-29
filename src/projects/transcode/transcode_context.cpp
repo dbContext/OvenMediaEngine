@@ -7,14 +7,14 @@
 //
 //==============================================================================
 
-#include <iostream>
 #include <unistd.h>
+#include <iostream>
 
 #include "transcode_context.h"
+#include "transcode_private.h"
 
-#define OV_LOG_TAG "TranscodeContext"
-
-TranscodeContext::TranscodeContext()
+TranscodeContext::TranscodeContext(bool is_encoding_context)
+	: _is_encoding_context(is_encoding_context)
 {
 	SetTimeBase(1, 1000000);
 }
@@ -23,12 +23,12 @@ TranscodeContext::~TranscodeContext()
 {
 }
 
-void TranscodeContext::SetCodecId(common::MediaCodecId val)
+void TranscodeContext::SetCodecId(cmn::MediaCodecId val)
 {
 	_codec_id = val;
 }
 
-common::MediaCodecId TranscodeContext::GetCodecId()
+cmn::MediaCodecId TranscodeContext::GetCodecId() const
 {
 	return _codec_id;
 }
@@ -43,19 +43,19 @@ int32_t TranscodeContext::GetBitrate()
 	return _bitrate;
 }
 
-void TranscodeContext::SetAudioSample(common::AudioSample sample)
+void TranscodeContext::SetAudioSample(cmn::AudioSample sample)
 {
 	_audio_sample = sample;
 }
 
-common::AudioSample TranscodeContext::GetAudioSample() const
+cmn::AudioSample TranscodeContext::GetAudioSample() const
 {
 	return _audio_sample;
 }
 
 void TranscodeContext::SetAudioSampleRate(int32_t val)
 {
-	_audio_sample.SetRate((common::AudioSample::Rate)val);
+	_audio_sample.SetRate((cmn::AudioSample::Rate)val);
 	// _audio_sample_rate = val;
 }
 
@@ -94,9 +94,14 @@ float TranscodeContext::GetFrameRate()
 	return _video_frame_rate;
 }
 
-common::Timebase &TranscodeContext::GetTimeBase()
+const cmn::Timebase &TranscodeContext::GetTimeBase() const
 {
 	return _time_base;
+}
+
+void TranscodeContext::SetTimeBase(const cmn::Timebase &timebase)
+{
+	_time_base = timebase;
 }
 
 void TranscodeContext::SetTimeBase(int32_t num, int32_t den)
@@ -114,23 +119,28 @@ int32_t TranscodeContext::GetGOP()
 	return _video_gop;
 }
 
-void TranscodeContext::SetAudioSampleFormat(common::AudioSample::Format val)
+void TranscodeContext::SetAudioSampleFormat(cmn::AudioSample::Format val)
 {
 	_audio_sample.SetFormat(val);
 }
 
-common::AudioChannel &TranscodeContext::GetAudioChannel()
+void TranscodeContext::SetAudioChannel(cmn::AudioChannel channel)
+{
+	_audio_channel = channel;
+}
+
+cmn::AudioChannel &TranscodeContext::GetAudioChannel()
 {
 	return _audio_channel;
 }
 
-const common::AudioChannel &TranscodeContext::GetAudioChannel() const
+
+const cmn::AudioChannel &TranscodeContext::GetAudioChannel() const
 {
 	return _audio_channel;
 }
 
-common::MediaType TranscodeContext::GetMediaType() const
+cmn::MediaType TranscodeContext::GetMediaType() const
 {
 	return _media_type;
 }
-

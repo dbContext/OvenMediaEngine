@@ -1,103 +1,240 @@
-<?xml version="1.0" encoding="UTF-8"?>
+<?xml version="1.0" encoding="UTF-8" ?>
 
-<Server version="2">
+<Server version="8">
 	<Name>OvenMediaEngine</Name>
-	<Hosts>
-		<Host>
-			<Name>default</Name>
-			<IP>*</IP>
-			<!--
-            <TLS>
-                    <ChainCertPath>path/to/file.crt</ChainCertPath>
-                    <CertPath>path/to/file.crt</CertPath>
-                    <KeyPath>path/to/file.key</KeyPath>
-            </TLS>
-            -->
-			<Ports>
-				<Origin>9000</Origin>
-				<RTMPProvider>1935</RTMPProvider>
-				<HLS>80</HLS>
-				<DASH>80</DASH>
-				<WebRTC>
-					<IceCandidates>
-						<IceCandidate>*:10000-10005/udp</IceCandidate>
-					</IceCandidates>
-					<Signalling>3333</Signalling>
-				</WebRTC>
-			</Ports>
+	<!-- Host type (origin/edge) -->
+	<Type>origin</Type>
+	<!-- Specify IP address to bind (* means all IPs) -->
+	<IP>*</IP>
 
+	<!-- Settings for the ports to bind -->
+	<Bind>
+		<!-- Enable this configuration if you want to use API Server -->
+		<!--
+		<Managers>
+			<API>
+				<Port>48081</Port>
+			</API>
+		</Managers>
+		-->
+
+		<Providers>
+			<RTMP>
+				<Port>1935</Port>
+			</RTMP>
+			<MPEGTS>
+				<!--
+					Listen on port 4000~4005
+					This is just a demonstration to show that you can configure the port in several ways
+				-->
+				<Port>4000-4004,4005/udp</Port>
+			</MPEGTS>
+		</Providers>
+
+		<Publishers>
+			<OVT>
+				<Port>9000</Port>
+			</OVT>
+			<HLS>
+				<Port>80</Port>
+				<!-- If you want to use TLS, specify the TLS port -->
+				<!-- <TLSPort>443</TLSPort> -->
+			</HLS>
+			<DASH>
+				<Port>80</Port>
+				<!-- If you want to use TLS, specify the TLS port -->
+				<!-- <TLSPort>443</TLSPort> -->
+			</DASH>
+			<WebRTC>
+				<Signalling>
+					<Port>3333</Port>
+					<!-- If you want to use TLS, specify the TLS port -->
+					<!-- <TLSPort>3334</TLSPort> -->
+				</Signalling>
+				<IceCandidates>
+					<IceCandidate>*:10000-10005/udp</IceCandidate>
+				</IceCandidates>
+			</WebRTC>
+		</Publishers>
+	</Bind>
+
+	<!-- P2P works only in WebRTC -->
+	<!--
+	<P2P>
+		<MaxClientPeersPerHostPeer>2</MaxClientPeersPerHostPeer>
+	</P2P>
+	-->
+
+	<!-- Enable this configuration if you want to use API Server -->
+	<!--
+	<Managers>
+		<Host>
+			<Names>
+				<Name>*</Name>
+			</Names>
+			<TLS>
+				<CertPath>path/to/file.crt</CertPath>
+				<KeyPath>path/to/file.key</KeyPath>
+				<ChainCertPath>path/to/file.crt</ChainCertPath>
+			</TLS>
+		</Host>
+		<API>
+			<AccessToken>ome-access-token</AccessToken>
+		</API>
+	</Managers>
+	-->
+
+	<VirtualHosts>
+		<!-- You can use wildcard like this to include multiple XMLs -->
+		<VirtualHost include="VHost*.xml" />
+		<VirtualHost>
+			<Name>default</Name>
+
+			<!-- Settings for multi ip/domain and TLS -->
+			<Host>
+				<Names>
+					<!-- Host names
+						<Name>stream1.airensoft.com</Name>
+						<Name>stream2.airensoft.com</Name>
+						<Name>*.sub.airensoft.com</Name>
+						<Name>192.168.0.1</Name>
+					-->
+					<Name>*</Name>
+				</Names>
+				<!--
+				<TLS>
+					<CertPath>path/to/file.crt</CertPath>
+					<KeyPath>path/to/file.key</KeyPath>
+					<ChainCertPath>path/to/file.crt</ChainCertPath>
+				</TLS>
+				-->
+			</Host>
+
+			<!-- Refer https://airensoft.gitbook.io/ovenmediaengine/signedpolicy
+
+			<SignedPolicy>
+				<PolicyQueryKeyName>policy</PolicyQueryKeyName>
+				<SignatureQueryKeyName>signature</SignatureQueryKeyName>
+				<SecretKey>aKq#1kj</SecretKey>
+
+				<Enables>
+					<Providers>rtmp</Providers>
+					<Publishers>webrtc,hls,dash,lldash</Publishers>
+				</Enables>
+			</SignedPolicy>
+			-->
+
+			<!--
+			<Origins>
+			
+				<Origin>
+					<Location>/app/stream</Location>
+					<Pass>
+						<Scheme>ovt</Scheme>
+						<Urls><Url>origin.com:9000/app/stream_720p</Url></Urls>
+					</Pass>
+				</Origin>
+				<Origin>
+					<Location>/app/</Location>
+					<Pass>
+						<Scheme>ovt</Scheme>
+						<Urls><Url>origin.com:9000/app/</Url></Urls>
+					</Pass>
+				</Origin>
+				<Origin>
+					<Location>/edge/</Location>
+					<Pass>
+						<Scheme>ovt</Scheme>
+						<Urls><Url>origin.com:9000/app/</Url></Urls>
+					</Pass>
+				</Origin>
+			</Origins>
+			-->
+			<!-- Settings for applications -->
 			<Applications>
 				<Application>
 					<Name>app</Name>
+					<!-- Application type (live/vod) -->
 					<Type>live</Type>
-					<Encodes>
-						<Encode>
-							<Name>VP8</Name>
-							<Audio>
-								<Codec>opus</Codec>
-								<Bitrate>128000</Bitrate>
-								<Samplerate>48000</Samplerate>
-								<Channel>2</Channel>
-							</Audio>
-							<Video>
-								<Codec>vp8</Codec>
-								<Width>640</Width>
-								<Height>360</Height>
-								<Bitrate>500000</Bitrate>
-								<Framerate>30.0</Framerate>
-							</Video>
-						</Encode>
-						<Encode>
-							<Name>H264</Name>
-							<Audio>
-								<Codec>aac</Codec>
-								<Bitrate>128000</Bitrate>
-								<Samplerate>48000</Samplerate>
-								<Channel>2</Channel>
-							</Audio>
-							<Video>
-								<Codec>h264</Codec>
-								<Width>640</Width>
-								<Height>360</Height>
-								<Bitrate>500000</Bitrate>
-								<Framerate>30.0</Framerate>
-							</Video>
-						</Encode>
-					</Encodes>
-					<Streams>
-						<Stream>
-							<Name>${OriginStreamName}_o</Name>
-							<Profiles>
-								<Profile>VP8</Profile>
-								<Profile>H264</Profile>
-							</Profiles>
-						</Stream>
-					</Streams>
+					<OutputProfiles>
+						<OutputProfile>
+							<Name>bypass_stream</Name>
+							<OutputStreamName>${OriginStreamName}</OutputStreamName>
+							<Encodes>
+								<Audio>
+									<Bypass>true</Bypass>
+								</Audio>
+								<Video>
+									<Bypass>true</Bypass>
+								</Video>
+								<Audio>
+									<Codec>opus</Codec>
+									<Bitrate>128000</Bitrate>
+									<Samplerate>48000</Samplerate>
+									<Channel>2</Channel>
+								</Audio>
+								<!-- 							
+								<Video>
+									<Codec>vp8</Codec>
+									<Bitrate>1024000</Bitrate>
+									<Framerate>30</Framerate>
+									<Width>1280</Width>
+									<Height>720</Height>
+								</Video>								
+								-->
+							</Encodes>
+						</OutputProfile>
+					</OutputProfiles>
 					<Providers>
+						<OVT />
 						<RTMP />
+						<MPEGTS>
+							<StreamMap>
+								<!--
+									Set the stream name of the client connected to the port to "stream_${Port}"
+									For example, if a client connets to port 4000, OME creates a "stream_4000" stream
+								-->
+								<Stream>
+									<Name>stream_${Port}</Name>
+									<Port>4000,4001-4004</Port>
+								</Stream>
+								<Stream>
+									<Name>stream_4005</Name>
+									<Port>4005</Port>
+								</Stream>
+							</StreamMap>
+						</MPEGTS>
+						<RTSPPull />
 					</Providers>
 					<Publishers>
-						<ThreadCount>2</ThreadCount>
+						<SessionLoadBalancingThreadCount>8</SessionLoadBalancingThreadCount>
+						<OVT />
+						<WebRTC>
+							<Timeout>30000</Timeout>
+						</WebRTC>
 						<HLS>
 							<SegmentDuration>5</SegmentDuration>
 							<SegmentCount>3</SegmentCount>
-							<CrossDomain>
+							<CrossDomains>
 								<Url>*</Url>
-							</CrossDomain>
+							</CrossDomains>
 						</HLS>
 						<DASH>
 							<SegmentDuration>5</SegmentDuration>
 							<SegmentCount>3</SegmentCount>
-							<CrossDomain>
+							<CrossDomains>
 								<Url>*</Url>
-							</CrossDomain>
+							</CrossDomains>
 						</DASH>
-						<WebRTC>
-							<Timeout>30000</Timeout>
-						</WebRTC>
+						<LLDASH>
+							<SegmentDuration>5</SegmentDuration>
+							<CrossDomains>
+								<Url>*</Url>
+							</CrossDomains>
+						</LLDASH>
 					</Publishers>
 				</Application>
 			</Applications>
-		</Host>
-	</Hosts>
+		</VirtualHost>
+	</VirtualHosts>
 </Server>

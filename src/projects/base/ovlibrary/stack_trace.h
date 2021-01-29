@@ -20,8 +20,8 @@ namespace ov
 	public:
 		StackTrace() = delete;
 
-		static void InitializeStackTrace(const char *version);
 		static String GetStackTrace(int line_count = -1);
+		static void WriteStackTrace(std::ofstream &stream);
 
 	private:
 		struct ParseResult
@@ -29,15 +29,13 @@ namespace ov
 			char *module_name = nullptr;
 			char *address = nullptr;
 			char *function_name = nullptr;
+			char *demangled_function_name = nullptr;
 			char *offset = nullptr;
 		};
 
-		static void AbortHandler(int signum, siginfo_t *si, void *unused);
 		static String GetStackTraceInternal(int offset = 2, int line_count = -1);
-		static void WriteStackTrace(int signum, String sig_name);
 
 		static bool ParseLinuxStyleLine(char *line, ParseResult *parse_result);
 		static bool ParseMacOsStyleLine(char *line, ParseResult *parse_result);
-
 	};
-}
+}  // namespace ov

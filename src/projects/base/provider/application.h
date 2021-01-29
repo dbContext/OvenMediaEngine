@@ -13,14 +13,17 @@
 #include "base/common_types.h"
 #include "base/ovlibrary/ovlibrary.h"
 
-#include "base/media_route/media_route_application_connector.h"
+#include "base/mediarouter/media_route_application_connector.h"
+#include "stream.h"
+
+#include <shared_mutex>
 
 namespace pvd
 {
-	class Stream;
-
+	class Provider;
 	class Application : public info::Application, public MediaRouteApplicationConnector
 	{
+	public:
 		enum class ApplicationState : int8_t
 		{
 			Idle,
@@ -29,28 +32,43 @@ namespace pvd
 			Error
 		};
 
-	public:
-		bool Start();
-		bool Stop();
+		virtual bool Start();
+		virtual bool Stop();
 
-		std::shared_ptr<Stream> GetStreamById(uint32_t stream_id);
-		std::shared_ptr<Stream> GetStreamByName(ov::String stream_name);
+		const std::shared_ptr<Stream> GetStreamById(uint32_t stream_id);
+		const std::shared_ptr<Stream> GetStreamByName(ov::String stream_name);
 
-		std::shared_ptr<Stream> MakeStream();
-		bool CreateStream2(std::shared_ptr<Stream> stream);
-		bool DeleteStream2(std::shared_ptr<Stream> stream);
+		uint32_t 	IssueUniqueStreamId();
 
-		// 상위 클래스에서 Stream 객체를 생성해서 받아옴
-		virtual std::shared_ptr<Stream> OnCreateStream() = 0;
+		// Delete stream
+		virtual bool DeleteStream(const std::shared_ptr<Stream> &stream);
+		virtual bool DeleteAllStreams();
+
+		const char* GetApplicationTypeName() final;
+
+		std::shared_ptr<Provider> GetParentProvider()
+		{
+			return _provider;
+		}
+
+		ApplicationState GetState()
+		{
+			return _state;
+		}
 
 	protected:
-		explicit Application(const info::Application *application_info);
-		~Application() override;
+		Application(const std::shared_ptr<Provider> &provider, const info::Application &application_info);
+		virtual ~Application() override;
+	
+		virtual bool NotifyStreamCreated(const std::shared_ptr<Stream> &stream);
+		virtual bool NotifyStreamDeleted(const std::shared_ptr<Stream> &stream);
 
+		std::shared_mutex _streams_guard;
 		std::map<uint32_t, std::shared_ptr<Stream>> _streams;
 
 	private:
-		std::mutex _queue_guard;
-		std::condition_variable _queue_cv;
+		std::shared_ptr<Provider> _provider;
+		ApplicationState		_state = ApplicationState::Idle;
+		std::atomic<info::stream_id_t>	_last_issued_stream_id { 0 };
 	};
 }

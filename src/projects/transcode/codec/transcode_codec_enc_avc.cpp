@@ -7,184 +7,254 @@
 //
 //==============================================================================
 #include "transcode_codec_enc_avc.h"
+
 #include <unistd.h>
 
-#define OV_LOG_TAG "TranscodeCodec"
+#include "../transcode_private.h"
 
 OvenCodecImplAvcodecEncAVC::~OvenCodecImplAvcodecEncAVC()
 {
-	if(_encoder)
-	{
-		_encoder->Uninitialize();
-		WelsDestroySVCEncoder(_encoder);
-	}
+	Stop();
 }
 
+// Notes.
+//
+// - B-frame must be disabled. because, WEBRTC does not support B-Frame.
+//
 bool OvenCodecImplAvcodecEncAVC::Configure(std::shared_ptr<TranscodeContext> context)
 {
-	if(WelsCreateSVCEncoder(&_encoder))
+	if (TranscodeEncoder::Configure(context) == false)
 	{
-		_encoder->Uninitialize();
-		logte("Unable to create H264 encoder");
 		return false;
 	}
 
-	SEncParamExt param;
-	::memset(&param, 0, sizeof(SEncParamExt));
+	auto codec_id = GetCodecID();
 
-	_encoder->GetDefaultParams(&param);
+	AVCodec *codec = ::avcodec_find_encoder(codec_id);
 
-	param.fMaxFrameRate = context->GetFrameRate();
-	param.iPicWidth = context->GetVideoWidth();
-	param.iPicHeight = context->GetVideoHeight();
-	param.iTargetBitrate = context->GetBitrate();
-	param.iRCMode = RC_OFF_MODE;
-	param.iTemporalLayerNum = 1;
-	param.iSpatialLayerNum = 1;
-	param.bEnableDenoise = false;
-	param.bEnableBackgroundDetection = true;
-	param.bEnableAdaptiveQuant = true;
-	param.bEnableFrameSkip = false;
-	param.bEnableLongTermReference = false;
-	param.iLtrMarkPeriod = 30;
-	param.uiIntraPeriod = 30; // KeyFrame Interval (1 sec)
-	param.eSpsPpsIdStrategy = CONSTANT_ID;
-	param.bPrefixNalAddingCtrl = false;
-	param.sSpatialLayers[0].iVideoWidth = param.iPicWidth;
-	param.sSpatialLayers[0].iVideoHeight = param.iPicHeight;
-	param.sSpatialLayers[0].fFrameRate = param.fMaxFrameRate;
-	param.sSpatialLayers[0].iSpatialBitrate = param.iTargetBitrate;
-	param.sSpatialLayers[0].iMaxSpatialBitrate = param.iMaxBitrate;
-	param.sSpatialLayers[0].uiProfileIdc = PRO_BASELINE;
-	param.sSpatialLayers[0].uiLevelIdc = LEVEL_3_1;     // baseline & lvl 3.1 => profile-level-id=42e01f
-
-	if(_encoder->InitializeExt(&param))
+	if (codec == nullptr)
 	{
-		logte("H264 encoder initialize failed");
+		logte("Could not find encoder: %d (%s)", codec_id, ::avcodec_get_name(codec_id));
 		return false;
 	}
 
-	int videoFormat = videoFormatI420;
-	_encoder->SetOption (ENCODER_OPTION_DATAFORMAT, &videoFormat);
+	_context = ::avcodec_alloc_context3(codec);
+
+	if (_context == nullptr)
+	{
+		logte("Could not allocate codec context for %s (%d)", ::avcodec_get_name(codec_id), codec_id);
+		return false;
+	}
+
+	_context->framerate = ::av_d2q(_output_context->GetFrameRate(), AV_TIME_BASE);
+
+	_context->bit_rate = _output_context->GetBitrate();
+	_context->rc_min_rate = _context->bit_rate;
+	_context->rc_max_rate = _context->bit_rate;
+	_context->rc_buffer_size = static_cast<int>(_context->bit_rate / 2);
+	_context->sample_aspect_ratio = (AVRational){1, 1};
+
+	// From avcodec.h:
+	// For some codecs, the time base is closer to the field rate than the frame rate.
+	// Most notably, H.264 and MPEG-2 specify time_base as half of frame duration
+	// if no telecine is used ...
+	// Set to time_base ticks per frame. Default 1, e.g., H.264/MPEG-2 set it to 2.
+	_context->ticks_per_frame = 2;
+	// From avcodec.h:
+	// For fixed-fps content, timebase should be 1/framerate and timestamp increments should be identically 1.
+	// This often, but not always is the inverse of the frame rate or field rate for video. 1/time_base is not the average frame rate if the frame rate is not constant.
+
+	AVRational codec_timebase = ::av_inv_q(::av_mul_q(::av_d2q(_output_context->GetFrameRate(), AV_TIME_BASE), (AVRational){_context->ticks_per_frame, 1}));
+	_context->time_base = codec_timebase;
+	_context->gop_size = _context->framerate.num / _context->framerate.den;
+	_context->max_b_frames = 0;
+	_context->pix_fmt = AV_PIX_FMT_YUV420P;
+	_context->width = _output_context->GetVideoWidth();
+	_context->height = _output_context->GetVideoHeight();
+	_context->thread_count = 2;
+
+	// 인코딩 품질 및 브라우저 호환성
+	// For browser compatibility
+	// _context->profile = FF_PROFILE_H264_MAIN;
+	_context->profile = FF_PROFILE_H264_BASELINE;
+
+	// 인코딩 성능
+	::av_opt_set(_context->priv_data, "preset", "ultrafast", 0);
+
+	// 인코딩 딜레이
+	::av_opt_set(_context->priv_data, "tune", "zerolatency", 0);
+
+	// 인코딩 딜레이에서 sliced-thread 옵션 제거. MAC 환경에서 브라우저 호환성
+	::av_opt_set(_context->priv_data, "x264opts", "bframes=0:sliced-threads=0:b-adapt=1:no-scenecut:keyint=30:min-keyint=30", 0);
+	// ::av_opt_set(_context->priv_data, "x264opts", "bframes=0:sliced-threads=0:b-adapt=1", 0);
+
+	// CBR 옵션 / bitrate는 kbps 단위 / *문제는 MAC 크롬에서 재생이 안된다. 그래서 maxrate 값만 지정해줌.
+	// x264opts.AppendFormat(":nal-hrd=cbr:force-cfr=1:bitrate=%d:vbv-maxrate=%d:vbv-bufsize=%d:", _context->bit_rate/1000,  _context->bit_rate/1000,  _context->bit_rate/1000);
+
+	if (::avcodec_open2(_context, codec, nullptr) < 0)
+	{
+		logte("Could not open codec: %s (%d)", ::avcodec_get_name(codec_id), codec_id);
+		return false;
+	}
+
+	// Generates a thread that reads and encodes frames in the input_buffer queue and places them in the output queue.
+	try
+	{
+		_kill_flag = false;
+
+		_thread_work = std::thread(&OvenCodecImplAvcodecEncAVC::ThreadEncode, this);
+		pthread_setname_np(_thread_work.native_handle(), "EncAVC");
+	}
+	catch (const std::system_error &e)
+	{
+		_kill_flag = true;
+
+		logte("Failed to start transcode stream thread.");
+	}
 
 	return true;
 }
 
-void OvenCodecImplAvcodecEncAVC::SendBuffer(std::unique_ptr<const MediaFrame> frame)
+void OvenCodecImplAvcodecEncAVC::Stop()
 {
-	TranscodeEncoder::SendBuffer(std::move(frame));
+	_kill_flag = true;
+
+	_input_buffer.Stop();
+	_output_buffer.Stop();
+	
+	if (_thread_work.joinable())
+	{
+		_thread_work.join();
+		logtd("AVC encoder thread has ended.");
+	}
 }
 
-std::unique_ptr<MediaPacket> OvenCodecImplAvcodecEncAVC::RecvBuffer(TranscodeResult *result)
+void OvenCodecImplAvcodecEncAVC::ThreadEncode()
 {
+	while (!_kill_flag)
+	{
+		auto obj = _input_buffer.Dequeue();
+		if (obj.has_value() == false)
+			continue;
+
+		auto frame = std::move(obj.value());
+
+		///////////////////////////////////////////////////
+		// Request frame encoding to codec
+		///////////////////////////////////////////////////
+
+		_frame->format = frame->GetFormat();
+		_frame->nb_samples = 1;
+		_frame->pts = frame->GetPts();
+		// The encoder will not pass this duration
+		_frame->pkt_duration = frame->GetDuration();
+
+		_frame->width = frame->GetWidth();
+		_frame->height = frame->GetHeight();
+		_frame->linesize[0] = frame->GetStride(0);
+		_frame->linesize[1] = frame->GetStride(1);
+		_frame->linesize[2] = frame->GetStride(2);
+
+		if (::av_frame_get_buffer(_frame, 32) < 0)
+		{
+			logte("Could not allocate the video frame data");
+			// *result = TranscodeResult::DataError;
+			break;
+		}
+
+		if (::av_frame_make_writable(_frame) < 0)
+		{
+			logte("Could not make sure the frame data is writable");
+			// *result = TranscodeResult::DataError;
+			break;
+		}
+
+		::memcpy(_frame->data[0], frame->GetBuffer(0), frame->GetBufferSize(0));
+		::memcpy(_frame->data[1], frame->GetBuffer(1), frame->GetBufferSize(1));
+		::memcpy(_frame->data[2], frame->GetBuffer(2), frame->GetBufferSize(2));
+
+		int ret = ::avcodec_send_frame(_context, _frame);
+		// int ret = 0;
+		::av_frame_unref(_frame);
+
+		if (ret < 0)
+		{
+			logte("Error sending a frame for encoding : %d", ret);
+
+			// Failure to send frame to encoder. Wait and put it back in. But it doesn't happen as often as possible.
+			// _input_buffer.Enqueue(std::move(frame));
+		}
+
+		///////////////////////////////////////////////////
+		// The encoded packet is taken from the codec.
+		///////////////////////////////////////////////////
+		while (true)
+		{
+			// Check frame is availble
+			int ret = ::avcodec_receive_packet(_context, _packet);
+
+			if (ret == AVERROR(EAGAIN))
+			{
+				// More packets are needed for encoding.
+
+				// logte("Error receiving a packet for decoding : EAGAIN");
+
+				break;
+			}
+			else if (ret == AVERROR_EOF)
+			{
+				logte("Error receiving a packet for decoding : AVERROR_EOF");
+				break;
+			}
+			else if (ret < 0)
+			{
+				logte("Error receiving a packet for decoding : %d", ret);
+				break;
+			}
+			else
+			{
+				// Encoded packet is ready
+				auto packet_buffer = std::make_shared<MediaPacket>(
+					cmn::MediaType::Video,
+					0,
+					_packet->data,
+					_packet->size,
+					_packet->pts,
+					_packet->dts,
+					-1L,
+					(_packet->flags & AV_PKT_FLAG_KEY) ? MediaPacketFlag::Key : MediaPacketFlag::NoFlag);
+				packet_buffer->SetBitstreamFormat(cmn::BitstreamFormat::H264_ANNEXB);
+				packet_buffer->SetPacketType(cmn::PacketType::NALU);
+
+				::av_packet_unref(_packet);
+
+				SendOutputBuffer(std::move(packet_buffer));
+			}
+		}
+	}
+}
+
+std::shared_ptr<MediaPacket> OvenCodecImplAvcodecEncAVC::RecvBuffer(TranscodeResult *result)
+{
+	if (!_output_buffer.IsEmpty())
+	{
+		*result = TranscodeResult::DataReady;
+
+		auto obj = _output_buffer.Dequeue();
+		if (obj.has_value())
+		{
+			return std::move(obj.value());
+		}
+	}
+
 	*result = TranscodeResult::NoData;
 
-	if(_input_buffer.empty())
-	{
-		return nullptr;
-	}
-
-	while(!_input_buffer.empty())
-	{
-		auto frame_buffer = std::move(_input_buffer[0]);
-		_input_buffer.erase(_input_buffer.begin(), _input_buffer.begin() + 1);
-
-		const MediaFrame *frame = frame_buffer.get();
-		OV_ASSERT2(frame != nullptr);
-
-		const uint8_t start_code[4] = { 0, 0, 0, 1 };
-		const int64_t pts = frame->GetPts();
-		SFrameBSInfo fbi = { 0 };
-		SSourcePicture sp = { 0 };
-		size_t required_size = 0, fragments_count = 0;
-
-		sp.iColorFormat = videoFormatI420;
-		for(int i = 0; i < 3; ++i)
-		{
-			sp.iStride[i] = frame->GetStride(i);
-			sp.pData[i] = (__u_char *)frame->GetBuffer(i);
-		}
-		sp.iPicWidth = frame->GetWidth();
-		sp.iPicHeight = frame->GetHeight();
-
-		if(_encoder->EncodeFrame(&sp, &fbi) != cmResultSuccess)
-		{
-			logte("Encode Frame Error");
-			*result = TranscodeResult::DataError;
-			return nullptr;
-		}
-
-		if(fbi.eFrameType == videoFrameTypeSkip)
-		{
-			continue;
-		}
-
-		for(int layer = 0; layer < fbi.iLayerNum; ++layer)
-		{
-			const SLayerBSInfo &layerInfo = fbi.sLayerInfo[layer];
-			for(int nal = 0; nal < layerInfo.iNalCount; ++nal, ++fragments_count)
-			{
-				required_size += layerInfo.pNalLengthInByte[nal];
-			}
-		}
-
-		if(required_size == 0)
-		{
-			logte("Encode Frame Error");
-			*result = TranscodeResult::DataError;
-			return nullptr;
-		}
-
-		auto encoded = std::make_unique<uint8_t[]>(required_size);
-		auto frag_hdr = std::make_unique<FragmentationHeader>();
-
-		if(fragments_count > MAX_FRAG_COUNT)
-		{
-			logte("Unexpected H264 fragments_count=%d", fragments_count);
-			*result = TranscodeResult::DataError;
-			return nullptr;
-		}
-
-		frag_hdr->VerifyAndAllocateFragmentationHeader(fragments_count);
-		size_t frag = 0;
-		size_t encoded_length = 0;
-		for(int layer = 0; layer < fbi.iLayerNum; ++layer)
-		{
-			const SLayerBSInfo &layerInfo = fbi.sLayerInfo[layer];
-			size_t layer_len = 0;
-			for(int nal = 0; nal < layerInfo.iNalCount; ++nal, ++frag)
-			{
-				frag_hdr->fragmentation_offset[frag] =
-					encoded_length + layer_len + sizeof(start_code);
-				frag_hdr->fragmentation_length[frag] =
-					layerInfo.pNalLengthInByte[nal] - sizeof(start_code);
-				layer_len += layerInfo.pNalLengthInByte[nal];
-			}
-			::memcpy(encoded.get() + encoded_length, layerInfo.pBsBuf, layer_len);
-			encoded_length += layer_len;
-		}
-
-		/*
-		NON-IDR(0x61) - fragments_count : 1
-			00 | 00 00 00 01 61 E0 00 40 00 9C 8F 03 8F 4E 28 6F
-			10 | A7 D0 D7 23 55 B8 1C 3A BA 07 8E 49 68 FF 88 B9
-
-		SPS(0x67) + PPS(0x68) + IDR(0x65) - fragments_count : 3
-			00 | 00 00 00 01 67 42 C0 1E 8C 8D 40 F0 52 40 3C 22
-			10 | 11 A8 00 00 00 01 68 CE 3C 80 00 00 00 01 65 B8
-		*/
-
-		auto packet_buffer = std::make_unique<MediaPacket>(
-			common::MediaType::Video,
-			0,
-			encoded.get(),
-			encoded_length,
-			(pts == 0) ? -1 : pts,
-			(fbi.eFrameType == videoFrameTypeIDR) ? MediaPacketFlag::Key : MediaPacketFlag::NoFlag);
-		packet_buffer->_frag_hdr = std::move(frag_hdr);
-
-		*result = TranscodeResult::DataReady;
-		return std::move(packet_buffer);
-	}
 	return nullptr;
 }
+
+// std::shared_ptr<MediaPacket> OvenCodecImplAvcodecEncAVC::MakePacket() const
+// {
+// 	auto packet = s
+
+// 	return std::move(packet);
+// }
